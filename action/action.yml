@@ -1,0 +1,147 @@
+name: ContextRail reviewer
+description: Install a published reviewer and review an eligible fixed PR comparison with retained evidence.
+inputs:
+  package-version:
+    description: 'Exact published @contextrail/code-review-agent npm version; no fallback.'
+    required: true
+  pr-number:
+    description: 'Number of the open same-repository PR to review.'
+    required: true
+  base-branch:
+    description: 'Required PR target branch; the caller owns branch policy.'
+    required: true
+  reviewer:
+    description: 'Published skill:// reviewer ID, not a run or repository ID.'
+    required: true
+  mcp-url:
+    description: 'HTTPS ContextRail MCP endpoint.'
+    required: true
+  mcp-org-id:
+    description: 'ContextRail organization scope.'
+    required: true
+  provider:
+    description: 'CLI provider: openai or openrouter.'
+    required: true
+  model:
+    description: 'Provider-native model ID.'
+    required: true
+  effort:
+    description: 'CLI effort; empty uses provider default.'
+    required: false
+    default: ''
+  max-time-ms:
+    description: 'Positive model-session time limit in milliseconds.'
+    required: true
+  feedback:
+    description: 'CLI feedback: send or off.'
+    required: false
+    default: 'send'
+  repository-attribution:
+    description: 'Explicitly disclose repository identity to ContextRail.'
+    required: false
+    default: 'false'
+  artifact-retention-days:
+    description: 'Evidence retention, 1-90 days, within repository policy.'
+    required: false
+    default: '7'
+  github-token:
+    description: 'GitHub token for private Git and PR API reads; contents/read and pull-requests/read.'
+    required: false
+    default: '${{ github.token }}'
+  mcp-auth-token:
+    description: 'ContextRail bearer credential; passed only to CLI step.'
+    required: true
+  openai-api-key:
+    description: 'Provider credential when provider is openai.'
+    required: false
+    default: ''
+  openrouter-api-key:
+    description: 'Provider credential when provider is openrouter.'
+    required: false
+    default: ''
+outputs:
+  review-exit:
+    description: 'Unmodified CLI exit 0/1/2; empty when not invoked or interrupted.'
+    value: ${{ steps.review.outputs.exit }}
+  run-id:
+    description: 'Unique CLI runId when confirmed by saved evidence.'
+    value: ${{ steps.summary.outputs.run-id }}
+  feedback-status:
+    description: 'CLI reporting status or unavailable.'
+    value: ${{ steps.summary.outputs.feedback-status }}
+  comparison-status:
+    description: 'Freshness at finish, superseded or unknown.'
+    value: ${{ steps.evidence.outputs.comparison-status }}
+  artifact-url:
+    description: 'GitHub evidence artifact URL when uploaded.'
+    value: ${{ steps.archive.outputs.artifact-url }}
+runs:
+  using: composite
+  steps:
+    - name: Set up Node
+      uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+      with:
+        node-version: '22.18.0'
+        package-manager-cache: false
+        token: ''
+    - name: Validate and install published reviewer
+      id: setup
+      shell: bash
+      env:
+        PACKAGE_VERSION: ${{ inputs.package-version }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        BASE_BRANCH: ${{ inputs.base-branch }}
+        REVIEWER: ${{ inputs.reviewer }}
+        MCP_URL: ${{ inputs.mcp-url }}
+        MCP_ORG_ID: ${{ inputs.mcp-org-id }}
+        PROVIDER: ${{ inputs.provider }}
+        MODEL: ${{ inputs.model }}
+        EFFORT: ${{ inputs.effort }}
+        MAX_TIME_MS: ${{ inputs.max-time-ms }}
+        FEEDBACK: ${{ inputs.feedback }}
+        REPOSITORY_ATTRIBUTION: ${{ inputs.repository-attribution }}
+        ARTIFACT_RETENTION_DAYS: ${{ inputs.artifact-retention-days }}
+      run: exec node "$GITHUB_ACTION_PATH/scripts/install.mjs"
+    - name: Prepare eligible fixed comparison
+      id: comparison
+      shell: bash
+      env:
+        REVIEW_ROOT: ${{ steps.setup.outputs.root }}
+        GH_READ_TOKEN: ${{ inputs.github-token }}
+      run: exec node "$GITHUB_ACTION_PATH/scripts/comparison.mjs"
+    - name: Invoke reviewer CLI
+      id: review
+      shell: bash
+      env:
+        REVIEW_ROOT: ${{ steps.setup.outputs.root }}
+        CONTEXTRAIL_MCP_AUTH_TOKEN: ${{ inputs.mcp-auth-token }}
+        OPENAI_API_KEY: ${{ inputs.openai-api-key }}
+        OPENROUTER_API_KEY: ${{ inputs.openrouter-api-key }}
+      run: exec node "$GITHUB_ACTION_PATH/scripts/review.mjs"
+    - name: Preserve available evidence and recheck currency
+      id: evidence
+      if: ${{ always() }}
+      shell: bash
+      env:
+        REVIEW_ROOT: ${{ steps.setup.outputs.root }}
+        GH_READ_TOKEN: ${{ inputs.github-token }}
+      run: exec node "$GITHUB_ACTION_PATH/scripts/evidence.mjs"
+    - name: Upload available evidence
+      id: archive
+      if: ${{ always() && steps.evidence.outputs.available == 'true' && steps.setup.outputs.retention != '' }}
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      with:
+        name: contextrail-review-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.action }}
+        path: ${{ steps.evidence.outputs.path }}
+        include-hidden-files: true
+        if-no-files-found: error
+        retention-days: ${{ steps.setup.outputs.retention }}
+    - name: Summarize confirmed result
+      id: summary
+      if: ${{ always() }}
+      shell: bash
+      env:
+        REVIEW_ROOT: ${{ steps.setup.outputs.root }}
+        ARTIFACT_URL: ${{ steps.archive.outputs.artifact-url }}
+        ARTIFACT_OUTCOME: ${{ steps.archive.outcome }}
+      run: exec node "$GITHUB_ACTION_PATH/scripts/summary.mjs"

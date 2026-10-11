@@ -1,0 +1,70 @@
+name: Publish reviewer
+on:
+  pull_request:
+    branches: [alpha, main]
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+concurrency:
+  group: reviewer-npm
+  cancel-in-progress: false
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: pnpm/action-setup@41ff72655975bd51cab0327fa583b6e92b6d3061
+        with:
+          version: 10.17.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24.15.0'
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build && pnpm run typecheck && pnpm run lint && pnpm test && npm pack --dry-run
+  publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && github.actor == vars.EXPORT_APP_BOT
+    needs: checks
+    runs-on: ubuntu-latest
+    environment: npm-publication
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: pnpm/action-setup@41ff72655975bd51cab0327fa583b6e92b6d3061
+        with:
+          version: 10.17.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24.15.0'
+          registry-url: https://registry.npmjs.org
+      - run: pnpm install --frozen-lockfile && pnpm run build
+      - name: Validate selected package and tag
+        id: release
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          node --input-type=module <<'NODE'
+          import { readFileSync, appendFileSync } from 'node:fs';
+          const release = JSON.parse(readFileSync('release.json'));
+          const manifest = JSON.parse(readFileSync('package.json'));
+          if (process.env.GITHUB_REPOSITORY !== 'contextrail/reviewer' ||
+              manifest.name !== '@contextrail/code-review-agent' || manifest.version !== release.version ||
+              process.env.GITHUB_REF_NAME !== `v${release.version}` || !/^[a-f0-9]{40}$/.test(release.sourceSha) ||
+              (release.branch === 'alpha'
+                ? release.channel !== 'alpha' || !/^\d+\.\d+\.\d+-alpha\.[1-9]\d*$/.test(release.version)
+                : release.branch !== 'main' || release.channel !== 'latest' || !/^\d+\.\d+\.\d+$/.test(release.version)))
+            throw new Error('Selected package/tag/channel mismatch');
+          appendFileSync(process.env.GITHUB_OUTPUT, `channel=${release.channel}\n`);
+          appendFileSync(process.env.GITHUB_STEP_SUMMARY, `Publish ${release.version} on ${release.channel}; private source ${release.sourceSha}; public source ${process.env.GITHUB_SHA}\n`);
+          NODE
+      - name: Publish selected version using npm trusted publishing
+        env:
+          CHANNEL: ${{ steps.release.outputs.channel }}
+        run: npm publish --access public --provenance --tag "$CHANNEL"

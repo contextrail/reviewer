@@ -1,0 +1,110 @@
+# Retained direct CLI example; select a qualified published version before enabling.
+# The public export fills REVIEWER_PACKAGE_VERSION with its selected version.
+# Licensed under Apache-2.0; confirm publication before enabling this credentialed workflow.
+name: Review against organizational guidance
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    # Forks, GitHub Bot accounts and unrelated events receive no credentials or review.
+    # A skipped job is not evidence that the change passed review.
+    if: >-
+      github.event_name == 'pull_request_target' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.type == 'User' &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      REVIEWER_PACKAGE_VERSION: '1.0.0-alpha.1'
+      REVIEWER_ID: skill://your-domain/your-reviewer
+      REVIEW_PROVIDER: openai
+      REVIEW_MODEL: REPLACE_WITH_PROVIDER_MODEL_ID
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22.18.0'
+          package-manager-cache: false
+          token: ''
+
+      - name: Install the reviewer outside the reviewed repository
+        working-directory: ${{ runner.temp }}
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/contextrail-tool"
+          npm install --prefix "$RUNNER_TEMP/contextrail-tool" \
+            --userconfig /dev/null --registry https://registry.npmjs.org \
+            --ignore-scripts --no-audit --no-fund --package-lock=false \
+            "@contextrail/code-review-agent@$REVIEWER_PACKAGE_VERSION"
+
+      - name: Fetch the fixed comparison without checking out contribution files
+        shell: bash
+        env:
+          GH_READ_TOKEN: ${{ github.token }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_SERVER: ${{ github.server_url }}
+        run: |
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ && "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$SOURCE_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          [[ "$SOURCE_SERVER" == 'https://github.com' ]]
+          git init --template= "$GITHUB_WORKSPACE/review-source"
+          git -C "$GITHUB_WORKSPACE/review-source" remote add origin \
+            "$SOURCE_SERVER/$SOURCE_REPOSITORY.git"
+          auth=$(printf 'x-access-token:%s' "$GH_READ_TOKEN" | base64 -w0)
+          # No depth/filter: both complete commit histories and supporting blobs are available.
+          git -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+            -c "http.extraHeader=AUTHORIZATION: basic $auth" \
+            -C "$GITHUB_WORKSPACE/review-source" fetch --no-tags origin "$BASE_SHA" "$HEAD_SHA"
+          git -C "$GITHUB_WORKSPACE/review-source" cat-file -e "$BASE_SHA^{commit}"
+          git -C "$GITHUB_WORKSPACE/review-source" cat-file -e "$HEAD_SHA^{commit}"
+
+      - name: Review the fixed commits
+        id: review
+        working-directory: ${{ runner.temp }}
+        shell: bash
+        env:
+          CONTEXTRAIL_MCP_URL: ${{ vars.CONTEXTRAIL_MCP_URL }}
+          CONTEXTRAIL_MCP_ORG_ID: ${{ vars.CONTEXTRAIL_MCP_ORG_ID }}
+          CONTEXTRAIL_MCP_AUTH_TOKEN: ${{ secrets.CONTEXTRAIL_MCP_AUTH_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          # For OpenRouter, replace the OpenAI entry with this secret and change provider/model.
+          # OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          # exec preserves 0 (accepted), 1 (blocker), or 2 (incomplete/error).
+          exec "$RUNNER_TEMP/contextrail-tool/node_modules/.bin/contextrail-review" review \
+            --reviewer "$REVIEWER_ID" --provider "$REVIEW_PROVIDER" --model "$REVIEW_MODEL" \
+            --repo "$GITHUB_WORKSPACE/review-source" --base "$BASE_SHA" --head "$HEAD_SHA" \
+            --feedback send
+
+      - name: Locate available review files
+        id: files
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          directory="$GITHUB_WORKSPACE/review-source/.contextrail/reviewer"
+          if [[ -d "$directory" ]] && [[ -n "$(find "$directory" -type f -print -quit)" ]]; then
+            echo 'available=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'available=false' >> "$GITHUB_OUTPUT"
+            echo 'No review files are available. Inspect setup and reviewer logs.'
+          fi
+
+      - name: Archive available reports and audit
+        if: ${{ always() && steps.files.outputs.available == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: contextrail-review-${{ github.run_id }}-${{ github.run_attempt }}
+          path: review-source/.contextrail/reviewer/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+          # Audits can contain source and model conversations; restrict artifact access.

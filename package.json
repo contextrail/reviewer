@@ -1,0 +1,67 @@
+{
+    "name": "@contextrail/code-review-agent",
+    "version": "1.0.0-alpha.1",
+    "description": "Review Git changes against your published organizational guidance and inspect findings with source evidence.",
+    "type": "module",
+    "main": "dist/index.js",
+    "types": "dist/index.d.ts",
+    "bin": {
+        "contextrail-review": "dist/cli.js"
+    },
+    "files": [
+        "dist/*.js",
+        "dist/*.d.ts",
+        "README.md",
+        "examples/review-pull-request.yml"
+    ],
+    "engines": {
+        "node": ">=22.18.0"
+    },
+    "license": "Apache-2.0",
+    "scripts": {
+        "build": "tsc",
+        "typecheck": "tsc --noEmit",
+        "lint": "eslint src tests action/scripts",
+        "test": "vitest run",
+        "prepack": "pnpm run build"
+    },
+    "dependencies": {
+        "@ai-sdk/openai": "4.0.83",
+        "@modelcontextprotocol/client": "2.1.0",
+        "@openrouter/ai-sdk-provider": "3.0.0",
+        "ai": "7.0.126",
+        "zod": "4.4.3"
+    },
+    "devDependencies": {
+        "@types/node": "22.18.10",
+        "typescript": "5.9.3",
+        "vitest": "4.0.16",
+        "@eslint/js": "9.39.2",
+        "@typescript-eslint/eslint-plugin": "8.50.0",
+        "@typescript-eslint/parser": "8.50.0",
+        "eslint": "9.39.2",
+        "eslint-plugin-prettier": "5.5.4",
+        "prettier": "3.7.4"
+    },
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/contextrail/reviewer.git"
+    },
+    "publishConfig": {
+        "access": "public",
+        "registry": "https://registry.npmjs.org/"
+    },
+    "packageManager": "pnpm@10.17.1",
+    "pnpm": {
+        "packageExtensions": {
+            "@openrouter/ai-sdk-provider@3.0.0": {
+                "dependencies": {
+                    "@ai-sdk/provider": "4.0.3"
+                }
+            }
+        },
+        "onlyBuiltDependencies": [
+            "esbuild"
+        ]
+    }
+}
