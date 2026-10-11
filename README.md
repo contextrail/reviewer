@@ -31,10 +31,10 @@ an instruction-only reviewer cannot supply this CLI's assessment scope.
 
 Install an exact published version from public npm (alpha versions use npm's `alpha` channel).
 The package is Apache-2.0 licensed. This source checkout's selected version is
-`1.0.0-alpha.1`; its immutable export attribution is in `release.json`.
+`1.0.0-alpha.2`; its immutable export attribution is in `release.json`.
 
 ```sh
-npm install --ignore-scripts @contextrail/code-review-agent@1.0.0-alpha.1
+npm install --ignore-scripts @contextrail/code-review-agent@1.0.0-alpha.2
 ./node_modules/.bin/contextrail-review --help
 ```
 
@@ -256,7 +256,7 @@ Select an independently reviewed public Action SHA and an exact qualified npm ve
 ```yaml
 - uses: contextrail/reviewer/action@ACTION_COMMIT_SHA
   with:
-      package-version: '1.0.0-alpha.1'
+      package-version: '1.0.0-alpha.2'
       pr-number: ${{ github.event.pull_request.number }}
       base-branch: alpha
       reviewer: skill://your-domain/your-reviewer
