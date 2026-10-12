@@ -1,15 +1,16 @@
 name: ContextRail reviewer
-description: Install a published reviewer and review an eligible fixed PR comparison with retained evidence.
+description: Install a published reviewer and review a caller-selected fixed PR comparison with retained evidence.
 inputs:
   package-version:
     description: 'Exact published @contextrail/code-review-agent npm version; no fallback.'
     required: true
   pr-number:
-    description: 'Number of the open same-repository PR to review.'
+    description: 'PR number in the workflow repository; the caller owns run authorization.'
     required: true
   base-branch:
-    description: 'Required PR target branch; the caller owns branch policy.'
-    required: true
+    description: 'Optional expected PR target branch; empty accepts any target branch.'
+    required: false
+    default: ''
   reviewer:
     description: 'Published skill:// reviewer ID, not a run or repository ID.'
     required: true
@@ -102,7 +103,7 @@ runs:
         REPOSITORY_ATTRIBUTION: ${{ inputs.repository-attribution }}
         ARTIFACT_RETENTION_DAYS: ${{ inputs.artifact-retention-days }}
       run: exec node "$GITHUB_ACTION_PATH/scripts/install.mjs"
-    - name: Prepare eligible fixed comparison
+    - name: Prepare fixed comparison
       id: comparison
       shell: bash
       env:

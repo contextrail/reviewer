@@ -38,7 +38,22 @@ await guarded('comparison', async () => {
     };
     git(['init', '--template=', repository]);
     git(['-C', repository, 'remote', 'add', 'origin', `https://github.com/${c.repository}.git`]);
-    git(['-C', repository, 'fetch', '--no-tags', '--no-recurse-submodules', 'origin', fixed.base, fixed.head], true);
+    // The base repository exposes PR heads, including forks; no contributor remote is trusted.
+    git(
+        [
+            '-C',
+            repository,
+            'fetch',
+            '--no-tags',
+            '--no-recurse-submodules',
+            'origin',
+            fixed.base,
+            `refs/pull/${c.pr}/head:refs/contextrail/review-head`,
+        ],
+        true,
+    );
+    if (git(['-C', repository, 'rev-parse', '--verify', 'refs/contextrail/review-head^{commit}']) !== fixed.head)
+        fail('superseded_comparison');
     for (const commit of Object.values(fixed)) {
         if (git(['-C', repository, 'rev-parse', '--verify', `${commit}^{commit}`]) !== commit)
             fail('fixed_commit_invalid');

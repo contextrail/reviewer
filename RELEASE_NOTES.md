@@ -1,6 +1,6 @@
-## 1.0.0-alpha.2 (2026-10-11)
+## 1.0.0-alpha.3 (2026-10-12)
 
 ### Fixes and improvements
 
-* **reviewer:** update workflow var 2 7d1b857
+* **reviewer:** delegate review run policy to consumers bad6727
 

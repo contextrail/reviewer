@@ -41,18 +41,18 @@ await guarded('setup', () => {
         !positive(e.ARTIFACT_RETENTION_DAYS, 90) ||
         !positive(e.PR_NUMBER, Number.MAX_SAFE_INTEGER) ||
         !bounded(e.GITHUB_REPOSITORY, /^[A-Za-z0-9_-][A-Za-z0-9_.-]*\/[A-Za-z0-9_-][A-Za-z0-9_.-]*$/, 301) ||
-        !bounded(e.BASE_BRANCH, /^(?!-)[A-Za-z0-9._/-]+$/, 200) ||
+        (e.BASE_BRANCH && !bounded(e.BASE_BRANCH, /^(?!-)[A-Za-z0-9._/-]+$/, 200)) ||
         e.GITHUB_SERVER_URL !== 'https://github.com'
     )
         fail('invalid_configuration');
     output('retention', e.ARTIFACT_RETENTION_DAYS);
     const event = read(e.GITHUB_EVENT_PATH);
     let fixed = null;
-    if (e.GITHUB_EVENT_NAME === 'pull_request_target' && event?.action === 'labeled') {
+    if (['pull_request', 'pull_request_target'].includes(e.GITHUB_EVENT_NAME)) {
         if (String(event.pull_request?.number) !== e.PR_NUMBER) fail('event_rejected');
         fixed = { base: event.pull_request?.base?.sha, head: event.pull_request?.head?.sha };
         if (!Object.values(fixed).every((v) => /^[a-f0-9]{40}$/.test(v ?? ''))) fail('event_comparison_invalid');
-    } else if (e.GITHUB_EVENT_NAME !== 'workflow_dispatch') fail('event_rejected');
+    }
     const c = {
         packageVersion: e.PACKAGE_VERSION,
         reviewer: e.REVIEWER,

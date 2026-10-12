@@ -35,17 +35,17 @@ export const gitEnvironment = () => ({
 });
 export const sha = (value) => /^[a-f0-9]{40}$/.test(value ?? '');
 export function eligible(pr, c) {
-    return (
-        pr?.state === 'open' &&
-        pr.number === c.pr &&
-        pr.base?.ref === c.baseBranch &&
-        pr.base?.repo?.full_name === c.repository &&
-        pr.head?.repo?.full_name === c.repository &&
-        pr.user?.type === 'User' &&
-        ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(pr.author_association) &&
-        sha(pr.base?.sha) &&
-        sha(pr.head?.sha)
-    );
+    const checks = {
+        requested_pr_number: pr?.number === c.pr,
+        target_branch: !c.baseBranch || pr?.base?.ref === c.baseBranch,
+        base_repository: pr?.base?.repo?.full_name === c.repository,
+        base_commit: sha(pr?.base?.sha),
+        head_commit: sha(pr?.head?.sha),
+    };
+    const failed = Object.keys(checks).filter((key) => !checks[key]);
+    // Log only our fixed condition names, never upstream values or credentials.
+    if (failed.length) logError(`ContextRail PR comparison validation failed: ${failed.join(', ')}`);
+    return failed.length === 0;
 }
 export async function currentPR(c) {
     if (!e.GH_READ_TOKEN) fail('github_token_missing');

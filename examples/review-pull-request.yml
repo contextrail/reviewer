@@ -12,17 +12,16 @@ permissions:
 
 jobs:
   review:
-    # Forks, GitHub Bot accounts and unrelated events receive no credentials or review.
+    # Example consumer policy: review same-repository human PRs on this event.
     # A skipped job is not evidence that the change passed review.
     if: >-
       github.event_name == 'pull_request_target' &&
       github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.user.type == 'User' &&
-      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
+      github.event.pull_request.user.type == 'User'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      REVIEWER_PACKAGE_VERSION: '1.0.0-alpha.2'
+      REVIEWER_PACKAGE_VERSION: '1.0.0-alpha.3'
       REVIEWER_ID: skill://your-domain/your-reviewer
       REVIEW_PROVIDER: openai
       REVIEW_MODEL: REPLACE_WITH_PROVIDER_MODEL_ID
