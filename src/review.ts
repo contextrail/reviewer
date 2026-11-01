@@ -7,7 +7,7 @@ import { z } from 'zod';
 import { atomicJson, digest, type PreparedState } from './prepare.js';
 import { EvidenceLedger } from './evidence.js';
 import { DEFAULT_POLICY, decideExit, validateResult, type ReviewEntry, type ReviewPolicy } from './results.js';
-import { reviewModel, reportedUsage, type ProviderConfiguration } from './providers.js';
+import { reviewModel, reportedUsage, providerFailureDiagnostics, type ProviderConfiguration } from './providers.js';
 import { FixedSnapshotSource, SourceAccessError, type SourceLimits } from './source.js';
 import { publicationSchema, type Publication } from './contracts.js';
 
@@ -483,6 +483,8 @@ export async function runReview(options: {
         try {
             await event('execution_stopped', {
                 reason: state.execution.stopReason,
+                call: state.execution.calls,
+                details: providerFailureDiagnostics(error),
                 status:
                     error && typeof error === 'object' && 'statusCode' in error && typeof error.statusCode === 'number'
                         ? error.statusCode

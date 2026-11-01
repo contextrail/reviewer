@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      REVIEWER_PACKAGE_VERSION: '1.0.0-alpha.3'
+      REVIEWER_PACKAGE_VERSION: '1.0.0-alpha.4'
       REVIEWER_ID: skill://your-domain/your-reviewer
       REVIEW_PROVIDER: openai
       REVIEW_MODEL: REPLACE_WITH_PROVIDER_MODEL_ID

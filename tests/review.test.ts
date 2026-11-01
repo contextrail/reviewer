@@ -10,7 +10,7 @@ import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { prepareReview, digest } from '../src/prepare.js';
 import { runReview } from '../src/review.js';
 import type { Publication, PublishedReader } from '../src/contracts.js';
-import type { ReviewProvider } from '../src/providers.js';
+import { providerFailureDiagnostics, type ReviewProvider } from '../src/providers.js';
 
 const directories: string[] = [];
 afterEach(() => {
@@ -561,6 +561,92 @@ describe('actual SDK provider wires and source/result tools', () => {
 });
 
 describe('additional failure and identity boundaries', () => {
+    it('records safe nested validation diagnostics when an HTTP-200 provider response is malformed', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key-never-capture');
+        const prepared = await preparedFixture();
+        const result = await runReview({
+            prepared,
+            provider: { provider: 'openrouter', model: 'fixture' },
+            feedback: 'off',
+            fetch: async () => {
+                const body = await response('openrouter', [], 0).json();
+                body.choices[0].message.reasoning_details = 'private reasoning must not appear';
+                return new Response(JSON.stringify(body), {
+                    headers: { 'content-type': 'application/json', 'x-private': 'private header must not appear' },
+                });
+            },
+        });
+        expect(result.state.reviewStatus).toBe('incomplete');
+        expect(result.state.decision?.exitCode).toBe(2);
+        const audit = readFileSync(join(result.directory, 'audit.jsonl'), 'utf8');
+        const stopped = audit
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line))
+            .find((event) => event.kind === 'execution_stopped');
+        expect(stopped.data).toMatchObject({
+            status: 200,
+            call: 1,
+            category: 'AI_APICallError',
+            details: {
+                causes: ['AI_APICallError', 'AI_TypeValidationError', 'ZodError'],
+                validation: expect.arrayContaining([
+                    {
+                        code: 'invalid_type',
+                        path: ['choices', 0, 'message', 'reasoning_details'],
+                        expected: 'array',
+                        actual: 'string',
+                    },
+                ]),
+            },
+        });
+        for (const sensitive of [
+            'private reasoning must not appear',
+            'private header must not appear',
+            'test-key-never-capture',
+        ])
+            expect(audit).not.toContain(sensitive);
+    });
+    it('bounds diagnostics and excludes arbitrary messages, field names and values', () => {
+        const secret = 'sensitive-value';
+        const error = {
+            name: 'AI_TypeValidationError',
+            message: secret,
+            value: { [secret]: secret },
+            cause: {
+                name: 'ZodError',
+                message: secret,
+                issues: Array.from({ length: 100 }, () => ({
+                    code: 'invalid_type',
+                    expected: 'array',
+                    path: [secret],
+                    message: secret,
+                    input: secret,
+                })),
+            },
+        };
+        const diagnostics = providerFailureDiagnostics(error);
+        expect(diagnostics.validation).toHaveLength(16);
+        expect(diagnostics.validation[0]).toEqual({
+            code: 'invalid_type',
+            path: ['[field]'],
+            expected: 'array',
+            actual: 'string',
+        });
+        error.cause.issues = [
+            { code: 'invalid_value', expected: secret, path: [secret], message: secret, input: secret },
+        ];
+        expect(providerFailureDiagnostics(error).validation[0]).toEqual({
+            code: 'invalid_value',
+            path: ['[field]'],
+            expected: 'unavailable',
+            actual: 'string',
+        });
+        expect(JSON.stringify(diagnostics)).not.toContain(secret);
+        const cycle: { cause?: unknown } = {};
+        cycle.cause = cycle;
+        expect(providerFailureDiagnostics(cycle).causes).toHaveLength(5);
+    });
     it('rejects duplicates and unknown identities while preserving a valid peer', async () => {
         vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
         const prepared = await preparedFixture();

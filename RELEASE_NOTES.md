@@ -1,6 +1,6 @@
-## 1.0.0-alpha.3 (2026-10-12)
+## 1.0.0-alpha.4 (2026-11-01)
 
 ### Fixes and improvements
 
-* **reviewer:** delegate review run policy to consumers bad6727
+* **reviewer:** capture safe provider validation diagnostics d96efac
 

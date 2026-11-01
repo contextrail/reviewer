@@ -8,6 +8,110 @@ export type ProviderConfiguration = {
     model: string;
     effort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
 };
+
+/** Capture schema failures without copying exception messages, response values or arbitrary field names. */
+export function providerFailureDiagnostics(error: unknown) {
+    const categories = new Set([
+        'AI_APICallError',
+        'AI_TypeValidationError',
+        'AI_JSONParseError',
+        'ZodError',
+        'SyntaxError',
+    ]);
+    const fields = new Set([
+        'choices',
+        'message',
+        'role',
+        'content',
+        'reasoning',
+        'reasoning_details',
+        'type',
+        'data',
+        'format',
+        'id',
+        'index',
+        'text',
+        'summary',
+        'signature',
+        'tool_calls',
+        'function',
+        'name',
+        'arguments',
+        'finish_reason',
+        'usage',
+        'prompt_tokens',
+        'completion_tokens',
+        'total_tokens',
+        'error',
+        'code',
+        'output',
+        'status',
+        'annotations',
+        'images',
+    ]);
+    const types = new Set(['string', 'number', 'integer', 'boolean', 'array', 'object', 'null', 'undefined']);
+    const codes = new Set([
+        'invalid_type',
+        'invalid_value',
+        'too_big',
+        'too_small',
+        'invalid_format',
+        'unrecognized_keys',
+    ]);
+    const causes: string[] = [];
+    const validation: Array<{ code: string; path: Array<string | number>; expected: string; actual: string }> = [];
+    let value: unknown;
+    let hasValue = false;
+    const collect = (issues: unknown, depth = 0) => {
+        if (!Array.isArray(issues) || depth > 4) return;
+        for (const issue of issues.slice(0, 16)) {
+            if (!issue || typeof issue !== 'object' || validation.length >= 16) continue;
+            if (issue.code === 'invalid_union' && Array.isArray(issue.errors)) {
+                for (const branch of issue.errors.slice(0, 8)) collect(branch, depth + 1);
+            }
+            if (!codes.has(issue.code) || !Array.isArray(issue.path)) continue;
+            const path = issue.path.slice(0, 16) as unknown[];
+            let actual = value;
+            for (const key of path) {
+                actual =
+                    actual && typeof actual === 'object' && (typeof key === 'string' || typeof key === 'number')
+                        ? (actual as Record<string | number, unknown>)[key]
+                        : undefined;
+            }
+            validation.push({
+                code: issue.code,
+                path: path.map((key) =>
+                    typeof key === 'number' && Number.isSafeInteger(key) && key >= 0
+                        ? key
+                        : typeof key === 'string' && fields.has(key)
+                          ? key
+                          : '[field]',
+                ),
+                expected: types.has(issue.expected) ? issue.expected : 'unavailable',
+                actual: !hasValue
+                    ? 'unavailable'
+                    : actual === null
+                      ? 'null'
+                      : Array.isArray(actual)
+                        ? 'array'
+                        : typeof actual,
+            });
+        }
+    };
+    let current = error;
+    for (let depth = 0; current && typeof current === 'object' && depth < 5; depth++) {
+        const cause = current as Record<string, unknown>;
+        causes.push(typeof cause.name === 'string' && categories.has(cause.name) ? cause.name : 'other');
+        if (cause.name === 'AI_TypeValidationError' && 'value' in cause) {
+            value = cause.value;
+            hasValue = true;
+        }
+        collect(cause.issues);
+        current = cause.cause;
+    }
+    return { causes, validation };
+}
+
 /** Construction only; no model substitution, retries, or domain policy. */
 export function reviewModel(
     config: ProviderConfiguration,
