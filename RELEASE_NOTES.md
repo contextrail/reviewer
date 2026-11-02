@@ -1,6 +1,6 @@
-## 1.0.0-alpha.4 (2026-11-01)
+## 1.0.0-alpha.5 (2026-11-02)
 
-### Fixes and improvements
+### Features
 
-* **reviewer:** capture safe provider validation diagnostics d96efac
+* **reviewer:** add stateful PR comments and operational summaries 5c218c3
 

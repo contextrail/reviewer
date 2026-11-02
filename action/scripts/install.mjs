@@ -1,9 +1,11 @@
+import process from 'node:process';
 import { copyFileSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { e, fail, guarded, output, read, runtimeEnvironment, write } from './common.mjs';
 
 await guarded('setup', () => {
+    const startedAt = new Date().toISOString();
     e.REVIEW_ROOT = mkdtempSync(join(e.RUNNER_TEMP, 'contextrail-review-'));
     output('root', e.REVIEW_ROOT);
     const positive = (v, max) => /^[1-9][0-9]*$/.test(v ?? '') && Number.isSafeInteger(Number(v)) && Number(v) <= max;
@@ -54,6 +56,8 @@ await guarded('setup', () => {
         if (!Object.values(fixed).every((v) => /^[a-f0-9]{40}$/.test(v ?? ''))) fail('event_comparison_invalid');
     }
     const c = {
+        startedAt,
+        nodeVersion: process.version,
         packageVersion: e.PACKAGE_VERSION,
         reviewer: e.REVIEWER,
         mcpUrl: e.MCP_URL,

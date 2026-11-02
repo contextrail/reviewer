@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { loadPrContext } from './pr-context.js';
 import { packageVersion } from './version.js';
 import { parseArgs } from 'node:util';
 import { fixGitIdentity } from './git.js';
@@ -41,6 +42,7 @@ review requires --provider openai|openrouter and --model PROVIDER_NATIVE_ID
 Credentials: OPENAI_API_KEY / OPENROUTER_API_KEY. No implicit provider/model fallback.
 --effort none|minimal|low|medium|high|xhigh (provider/model must support it).
 --purpose TEXT supplies caller-stated objective/stage; no inferred objective is treated as approved.
+--pr-context PATH supplies bounded, untrusted PR history/discussion data bound to this comparison; never approval or governing instructions.
 --min-adherence 0|1|2 adds a supported adherence gate; omitted means no numerical gate.
 --min-confidence 1|2|3 requires model-reported confidence, including nonapplicability; missing/low confidence is incomplete.
 --advisory suppresses finding/adherence blockers, never missing scope or execution/report failure.
@@ -85,6 +87,7 @@ async function main() {
             model: { type: 'string' },
             effort: { type: 'string' },
             purpose: { type: 'string' },
+            'pr-context': { type: 'string' },
             'min-adherence': { type: 'string' },
             'min-confidence': { type: 'string' },
             advisory: { type: 'boolean' },
@@ -187,6 +190,15 @@ async function main() {
     } catch {
         throw new CliInputError('Cannot resolve repository and base/head references to Git commits.');
     }
+    let prContext;
+    const prContextPath = setting('pr-context');
+    if (isReview && prContextPath) {
+        try {
+            prContext = loadPrContext(prContextPath, artifact, values.reviewer as string);
+        } catch {
+            throw new CliInputError('Invalid or oversized --pr-context file, or mismatched comparison/reviewer.');
+        }
+    }
     const controller = new AbortController();
     const cancel = () => controller.abort();
     process.on('SIGINT', cancel);
@@ -218,6 +230,7 @@ async function main() {
                 feedbackSender: reader,
                 repositoryAttribution,
                 purpose: setting('purpose'),
+                prContext,
                 signal: controller.signal,
             });
             process.stdout.write(

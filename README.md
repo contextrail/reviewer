@@ -31,10 +31,10 @@ an instruction-only reviewer cannot supply this CLI's assessment scope.
 
 Install an exact published version from public npm (alpha versions use npm's `alpha` channel).
 The package is Apache-2.0 licensed. This source checkout's selected version is
-`1.0.0-alpha.4`; its immutable export attribution is in `release.json`.
+`1.0.0-alpha.5`; its immutable export attribution is in `release.json`.
 
 ```sh
-npm install --ignore-scripts @contextrail/code-review-agent@1.0.0-alpha.4
+npm install --ignore-scripts @contextrail/code-review-agent@1.0.0-alpha.5
 ./node_modules/.bin/contextrail-review --help
 ```
 
@@ -242,7 +242,7 @@ timeout; runner termination cannot guarantee finalization or upload.
 The [composite Action](action/action.yml) runs an existing published
 `@contextrail/code-review-agent` package. The CLI owns assessment, evidence, unique
 `runId`, exit codes and ContextRail feedback. The Action owns installation, fixed
-comparison preparation, CLI invocation, a concise GitHub summary and evidence upload.
+comparison preparation, CLI invocation, GitHub health summaries, optional PR comments and evidence upload.
 The caller owns events, branch policy, permissions, runner, timeout, concurrency and
 configuration/secret references. There is no repository-source build or package-transfer fallback.
 
@@ -256,7 +256,7 @@ Select an independently reviewed public Action SHA and an exact qualified npm ve
 ```yaml
 - uses: contextrail/reviewer/action@ACTION_COMMIT_SHA
   with:
-      package-version: '1.0.0-alpha.4'
+      package-version: '1.0.0-alpha.5'
       pr-number: ${{ github.event.pull_request.number }}
       base-branch: alpha
       reviewer: skill://your-domain/your-reviewer
@@ -264,6 +264,9 @@ Select an independently reviewed public Action SHA and an exact qualified npm ve
       mcp-org-id: ${{ vars.CONTEXTRAIL_MCP_ORG_ID }}
       provider: openai
       model: REPLACE_WITH_PROVIDER_MODEL_ID
+      max-time-ms: '600000'
+      post-comment: 'true'
+      pr-context: 'true'
       mcp-auth-token: ${{ secrets.CONTEXTRAIL_MCP_AUTH_TOKEN }}
       openai-api-key: ${{ secrets.OPENAI_API_KEY }}
 ```
@@ -301,35 +304,40 @@ Only a trusted Action revision and independently qualified npm artifact may rece
 review credentials. Disabled lifecycle scripts do not make runtime package code
 trusted. Pin every executable Action to an independently reviewed full commit SHA.
 
-Use only `contents: read` and `pull-requests: read` for Git/API access. Artifact upload
-uses GitHub's artifact service; it does not require PR/issue/status write permissions.
-There are no PR comments, labels written by the Action or Slack integration.
+Without comments, use `contents: read` and `pull-requests: read`. To post the summary,
+set `post-comment: 'true'` and grant the review job `pull-requests: write`. The default is
+false so read-only consumers retain their existing permission boundary. Use the default
+GitHub Actions token; reruns update the matching `github-actions[bot]` comment for that
+reviewer. Other users' comments are never edited. Superseded comparisons and older runs
+cannot replace a newer comment. No labels or Slack messages are written.
 Keep this check optional by omitting it from branch protection/ruleset required checks.
-The Action always preserves CLI exit 0/1/2: do not add `continue-on-error` or advisory
+The `review-exit` output preserves CLI exit 0/1/2: do not add `continue-on-error` or advisory
 mode to make it green. If enforcement is wanted later, require the check through
 branch policy; failure semantics remain unchanged.
 
 ### Inputs, outputs and credentials
 
-| Input                                  | Contract                                                                                                  |
-| -------------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| `package-version`                      | Required exact published npm SemVer. No tags, ranges, URLs, local builds or unavailable-version fallback. |
-| `pr-number`, `base-branch`             | Required PR number and target branch policy.                                                              |
-| `reviewer`                             | Required reusable published `skill://` ID; never an execution or repository ID.                           |
-| `mcp-url`, `mcp-org-id`                | Required HTTPS endpoint and organization scope, using CLI connection vocabulary.                          |
-| `provider`, `model`                    | Required `openai` or `openrouter` and explicit provider-native model. No fallback.                        |
-| `effort`                               | Optional CLI effort; empty delegates to provider default.                                                 |
-| `max-time-ms`                          | Required positive model-session time limit, at most 2147483647 ms. Does not bound total job time.         |
-| `feedback`                             | `send` (default) or `off`; CLI owns report submission and its status.                                     |
-| `repository-attribution`               | `true` or `false` (default); explicitly includes repository identity in CLI retrieval/reporting.          |
-| `artifact-retention-days`              | 1–90, default 7, within repository/organization retention policy.                                         |
-| `github-token`                         | Defaults to `github.token`; GitHub Git/API read authority only.                                           |
-| `mcp-auth-token`                       | Required bearer credential; map from `secrets.CONTEXTRAIL_MCP_AUTH_TOKEN`.                                |
-| `openai-api-key`, `openrouter-api-key` | Supply the selected provider's credential from its named secret.                                          |
+| Input                                  | Contract                                                                                                                                                  |
+| -------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `package-version`                      | Required exact published npm SemVer. No tags, ranges, URLs, local builds or unavailable-version fallback.                                                 |
+| `pr-number`, `base-branch`             | Required PR number and target branch policy.                                                                                                              |
+| `reviewer`                             | Required reusable published `skill://` ID; never an execution or repository ID.                                                                           |
+| `mcp-url`, `mcp-org-id`                | Required HTTPS endpoint and organization scope, using CLI connection vocabulary.                                                                          |
+| `provider`, `model`                    | Required `openai` or `openrouter` and explicit provider-native model. No fallback.                                                                        |
+| `effort`                               | Optional CLI effort; empty delegates to provider default.                                                                                                 |
+| `max-time-ms`                          | Required positive model-session time limit, at most 2147483647 ms. Does not bound total job time.                                                         |
+| `feedback`                             | `send` (default) or `off`; CLI owns report submission and its status.                                                                                     |
+| `repository-attribution`               | `true` or `false` (default); explicitly includes repository identity in CLI retrieval/reporting.                                                          |
+| `artifact-retention-days`              | 1–90, default 7, within repository/organization retention policy.                                                                                         |
+| `post-comment`                         | `false` by default; `true` creates/updates the bot PR summary. Requires `pull-requests: write`.                                                           |
+| `pr-context`                           | `false` by default; collect bounded PR discussion/history for a matching CLI release supporting `--pr-context`. Sends that context to the selected model. |
+| `github-token`                         | Defaults to `github.token`; Git/API reads, plus PR comment writes when enabled.                                                                           |
+| `mcp-auth-token`                       | Required bearer credential; map from `secrets.CONTEXTRAIL_MCP_AUTH_TOKEN`.                                                                                |
+| `openai-api-key`, `openrouter-api-key` | Supply the selected provider's credential from its named secret.                                                                                          |
 
 Credentials are explicit Action inputs, never CLI arguments. Installation gets no
 GitHub, MCP or provider credentials. Git/API read credentials reach only comparison
-preparation and the final freshness read; they are not written into Git configuration
+preparation, the final freshness read and the opt-in comment step; they are not written into Git configuration
 or passed to the CLI. MCP and the selected provider key reach only the CLI subprocess;
 ambient CLI policy/provider settings are excluded. Prefer secret inputs over caller
 `env`: environment values on the calling step are inherited by every composite step.
@@ -343,12 +351,13 @@ security boundary against malicious trusted Action code.
 | `feedback-status`   | `received`, `failed`, `pending`, `off` or `unavailable`. Feedback failure preserves CLI exit.                   |
 | `comparison-status` | `current_at_finish`, `superseded` or `unknown`, when a comparison was prepared.                                 |
 | `artifact-url`      | Evidence artifact URL when upload succeeds.                                                                     |
+| `comment-status`    | `created`, `updated`, `skipped_superseded`, `skipped_newer` or `failed`; empty when disabled.                   |
 
 Available state, reports, audit, CLI diagnostics, comparison/setup status and npm lock
 with resolved dependency integrity are preserved after failure. Installed dependencies
 and fetched source objects are not uploaded. Evidence includes source/model material;
 restrict artifact access and retention accordingly. Ordinary logs and summaries use
-controlled statuses, identities and counts, not conversations or raw upstream errors.
+controlled statuses, identities, counts, bounded finding/correction text and unresolved reasons, not conversations, full source citations or raw upstream errors.
 The summary confirms completion only from matching persisted comparison/reviewer
 state. An ingestion receipt does not endorse a review.
 
@@ -359,6 +368,70 @@ feedback can already have been sent for the accurately recorded fixed comparison
 Cancellation or job timeout can prevent later upload/summary steps; use a finite job
 timeout with headroom beyond the model-session limit (this caller uses 20 minutes for
 600000 ms). Evidence preservation is attempted with `always()` after ordinary errors.
+
+### Operational summary and PR comment
+
+The summary distinguishes execution stop reason, assessment completeness, CLI exit and
+report ingestion. It includes bounded finding/correction text, unresolved assessments,
+exact comparison SHAs, package/reviewer identity, requested/returned models, runtime/SDK
+versions, review duration, elapsed time before summary, calls/steps, and reported cost/token
+usage. Links lead to the workflow and evidence artifact; full source citations and model conversations
+stay in the artifact. Model text is escaped to prevent injected Markdown, HTML and mentions.
+
+Cost uses provider wire usage when present, including HTTP-200 calls rejected by the SDK;
+SDK and wire records are never added together. Missing or partial per-call coverage is explicit,
+not zero cost. Output tokens already include reasoning. Provider-reported cost is not a verified
+invoice or total infrastructure cost. `received` confirms ingestion, not review approval.
+
+Comment creation/update is attempted after ordinary review failures with `always()`. A
+permission/API failure is visible in the Action summary and fails that step independently of
+`review-exit`; there is no automatic comment-write retry. Comments are scoped to the configured
+PR/reviewer and current comparison, with workflow/run-attempt links for traceability. Cancellation
+or job timeout can still prevent summary/comment execution. The caller should serialize runs per PR.
+The legacy inline CLI example does not implement these composite Action presentation features.
+
+After publishing this Action update, adopt its full public commit SHA as well as the intended
+exact npm version. Re-running an old workflow retains its old Action code and inputs.
+
+### Review history and conversational context
+
+The bot comment keeps a versioned, bounded state record in an HTML comment and a visible
+history table at the bottom. It retains ten reported runs with GitHub run/attempt links, unique CLI run IDs, exact work
+revisions, requested model, package/reviewer versions, execution/completion, finding/unresolved
+counts, duration and reported cost. Rerunning the same attempt replaces its row; later attempts
+add rows. A failed provider run does not erase the last finished assessment. That snapshot
+retains up to 30 criterion identities/publication versions and short findings/unresolved reasons.
+Older rows, skipped/comment-write failures and runs before adoption may be absent; the table
+links to GitHub's full workflow history. This is a convenience cache, not an exhaustive ledger.
+
+Hidden comments are readable, mutable PR content, not private storage, a signature or proof
+that a review passed. The Action reads only the matching bot-owned record, validates its
+version/repository/PR/reviewer and bounds its contents. Unsupported or corrupt state is treated
+as unavailable rather than trusted. PR comments persist independently of artifact retention.
+
+With `pr-context: 'true'`, a trusted read-only step collects recent 20 issue comments, 10 submitted
+reviews (including dismissed states), 10 dismissal events with reasons, and 10 native review threads with five replies each,
+including resolution/outdated state and authorship. At most 80 excerpts are supplied, with bodies capped at 1000 characters.
+The matching CLI's `--pr-context PATH` reads a schema-validated file capped at 200 KiB, bound to
+the current base/head/reviewer and reported GitHub repository. Prior assessment/head identities,
+criterion versions and up to 100 changed paths since that head are included when available.
+Missing history, pagination/truncation, inaccessible revisions and non-forward/force-push
+comparisons are explicit. There is no whole-repository snapshot mode or automatic new review trigger.
+
+Context is passed as a separate untrusted data field, never as caller purpose or governing
+instructions. Native approval, dismissal or thread resolution does not waive a Standard or
+prove a fix. The reviewer still accounts for every current criterion using current pinned
+source/publications; historical outcomes never pre-populate current results or change exit policy.
+Developer feedback can focus inspection and explain an addressed finding only with fresh evidence.
+Work, guidance and model revisions remain distinct; changed judgment alone does not establish drift.
+No tools for changing code, resolving threads or approving a PR are added.
+
+Opting in sends these PR excerpts and historical judgments to the selected model. GitHub tokens
+stay in trusted Action steps; known credentials are redacted before the model handoff. The raw
+collector file is not uploaded. A validated/redacted context snapshot and hash accompany the
+local run/audit; conversation bodies are excluded from the minimal ContextRail report projection.
+The health summary identifies supplied discussion/history coverage. Adopt both the new Action
+SHA and a CLI release supporting the input; an old package must not silently ignore the feature.
 
 ### Configure and qualify a consumer
 

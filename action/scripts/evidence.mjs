@@ -24,6 +24,7 @@ await guarded('evidence', async () => {
     mkdirSync(evidence, { recursive: true });
     for (const name of [
         'config.json',
+        'context-status.json',
         'setup-status.json',
         'comparison-status.json',
         'comparison.json',

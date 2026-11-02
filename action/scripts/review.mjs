@@ -30,6 +30,10 @@ await guarded('review', async () => {
         '--feedback',
         c.feedback,
     ];
+    if (e.PR_CONTEXT_PATH) {
+        if (e.PR_CONTEXT_PATH !== join(e.REVIEW_ROOT, 'pr-context.json')) fail('invalid_configuration');
+        args.push('--pr-context', e.PR_CONTEXT_PATH);
+    }
     if (c.effort) args.push('--effort', c.effort);
     if (c.repositoryAttribution) args.push('--repository-attribution');
     const stdout = openSync(join(e.REVIEW_ROOT, 'cli-stdout.log'), 'w', 0o600);

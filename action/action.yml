@@ -46,9 +46,17 @@ inputs:
     required: false
     default: '7'
   github-token:
-    description: 'GitHub token for private Git and PR API reads; contents/read and pull-requests/read.'
+    description: 'GitHub Actions token for Git/PR reads; pull-requests/write is also required when post-comment is true.'
     required: false
     default: '${{ github.token }}'
+  post-comment:
+    description: 'Create/update a github-actions bot PR comment with the review summary. Requires pull-requests/write.'
+    required: false
+    default: 'false'
+  pr-context:
+    description: 'Collect bounded prior bot history, PR discussions, resolutions and review states for a CLI version supporting --pr-context.'
+    required: false
+    default: 'false'
   mcp-auth-token:
     description: 'ContextRail bearer credential; passed only to CLI step.'
     required: true
@@ -76,6 +84,9 @@ outputs:
   artifact-url:
     description: 'GitHub evidence artifact URL when uploaded.'
     value: ${{ steps.archive.outputs.artifact-url }}
+  comment-status:
+    description: 'created, updated, skipped_superseded, skipped_newer, or failed; empty when disabled.'
+    value: ${{ steps.comment.outputs.comment-status }}
 runs:
   using: composite
   steps:
@@ -110,11 +121,20 @@ runs:
         REVIEW_ROOT: ${{ steps.setup.outputs.root }}
         GH_READ_TOKEN: ${{ inputs.github-token }}
       run: exec node "$GITHUB_ACTION_PATH/scripts/comparison.mjs"
+    - name: Collect PR history and discussion
+      id: context
+      if: ${{ inputs.pr-context == 'true' }}
+      shell: bash
+      env:
+        REVIEW_ROOT: ${{ steps.setup.outputs.root }}
+        GH_READ_TOKEN: ${{ inputs.github-token }}
+      run: exec node "$GITHUB_ACTION_PATH/scripts/context.mjs"
     - name: Invoke reviewer CLI
       id: review
       shell: bash
       env:
         REVIEW_ROOT: ${{ steps.setup.outputs.root }}
+        PR_CONTEXT_PATH: ${{ steps.context.outputs.path }}
         CONTEXTRAIL_MCP_AUTH_TOKEN: ${{ inputs.mcp-auth-token }}
         OPENAI_API_KEY: ${{ inputs.openai-api-key }}
         OPENROUTER_API_KEY: ${{ inputs.openrouter-api-key }}
@@ -146,3 +166,11 @@ runs:
         ARTIFACT_URL: ${{ steps.archive.outputs.artifact-url }}
         ARTIFACT_OUTCOME: ${{ steps.archive.outcome }}
       run: exec node "$GITHUB_ACTION_PATH/scripts/summary.mjs"
+    - name: Update PR review comment
+      id: comment
+      if: ${{ always() && inputs.post-comment == 'true' }}
+      shell: bash
+      env:
+        REVIEW_ROOT: ${{ steps.setup.outputs.root }}
+        GH_READ_TOKEN: ${{ inputs.github-token }}
+      run: exec node "$GITHUB_ACTION_PATH/scripts/comment.mjs"

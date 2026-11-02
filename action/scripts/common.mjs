@@ -1,3 +1,4 @@
+import { Buffer } from 'node:buffer';
 import process from 'node:process';
 import { error as logError } from 'node:console';
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
@@ -47,20 +48,44 @@ export function eligible(pr, c) {
     if (failed.length) logError(`ContextRail PR comparison validation failed: ${failed.join(', ')}`);
     return failed.length === 0;
 }
-export async function currentPR(c) {
+export async function githubRequest(c, path, method = 'GET', body) {
     if (!e.GH_READ_TOKEN) fail('github_token_missing');
-    const response = await globalThis.fetch(`https://api.github.com/repos/${c.repository}/pulls/${c.pr}`, {
+    const url =
+        path === 'graphql' ? 'https://api.github.com/graphql' : `https://api.github.com/repos/${c.repository}${path}`;
+    const response = await globalThis.fetch(url, {
+        method,
         headers: {
             Authorization: `Bearer ${e.GH_READ_TOKEN}`,
             Accept: 'application/vnd.github+json',
             'X-GitHub-Api-Version': '2022-11-28',
+            ...(body ? { 'Content-Type': 'application/json' } : {}),
         },
+        ...(body ? { body: JSON.stringify(body) } : {}),
         signal: globalThis.AbortSignal.timeout(30000),
         redirect: 'error',
     });
     if (!response.ok) fail('github_read_failed');
-    return response.json();
+    const reader = response.body?.getReader();
+    if (!reader) fail('github_read_failed');
+    const chunks = [];
+    let size = 0;
+    try {
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            size += value.byteLength;
+            if (size > 8 * 1024 * 1024) {
+                await reader.cancel();
+                fail('github_read_failed');
+            }
+            chunks.push(value);
+        }
+    } finally {
+        reader.releaseLock();
+    }
+    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
+export const currentPR = (c) => githubRequest(c, `/pulls/${c.pr}`);
 export async function guarded(stage, fn) {
     try {
         await fn();
