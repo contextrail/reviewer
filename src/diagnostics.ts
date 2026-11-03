@@ -31,6 +31,9 @@ const fields = new Set([
     'missing',
     'details',
     'causes',
+    'parse',
+    'retryScope',
+    'backoffMs',
     'validation',
     'citation',
     'ref',
@@ -116,9 +119,15 @@ export class Diagnostics {
             kind === 'execution_stopped' ||
             this.level === 'debug' ||
             (this.level === 'info' &&
-                ['phase_started', 'phase_completed', 'phase_failed', 'provider_retry', 'review_finalized'].includes(
-                    kind,
-                ))
+                [
+                    'phase_started',
+                    'phase_completed',
+                    'phase_failed',
+                    'provider_retry',
+                    'provider_recovered',
+                    'provider_retry_exhausted',
+                    'review_finalized',
+                ].includes(kind))
         )
             this.log(JSON.stringify(record) + '\n');
         return operation;

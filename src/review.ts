@@ -911,12 +911,15 @@ async function runPhaseModel<T>(session: PhaseRuntime<T>) {
     const tools = createPhaseTools(session),
         wire = createProviderFetch(session);
     const configured = reviewModel(models[phase], wire);
-    const model = recoverProviderCalls(configured.model, signal, (count, error) =>
-        diagnostics.event('provider_retry', {
+    const model = recoverProviderCalls(configured.model, signal, (event, count, error) =>
+        diagnostics.event(event, {
             phase,
             workUnitId,
             attempt,
             count,
+            call: state.execution.calls,
+            retryScope: 'request',
+            backoffMs: event === 'provider_retry' ? 250 * 2 ** (count - 1) : 0,
             ...providerFailureDiagnostics(error),
         }),
     );

@@ -1207,6 +1207,27 @@ describe('governed phase execution through actual SDK provider wires', () => {
 });
 
 describe('provider diagnostic bounds', () => {
+    it.each([
+        ['Object contains forbidden prototype property', 'prototype_property_rejected'],
+        ['Unexpected end of JSON input', 'unexpected_end'],
+        ['Unterminated string in JSON at position 3', 'unterminated_string'],
+        ['Bad control character in string literal in JSON at position 3', 'invalid_control_character'],
+        ['Unexpected token S, PRIVATE_PAYLOAD is not valid JSON', 'unexpected_token'],
+        ['PRIVATE_PAYLOAD', 'syntax_error'],
+    ])('classifies parser failures without retaining rejected content: %s', (message, code) => {
+        const text = '{"PRIVATE_PAYLOAD":"secret"}';
+        const result = providerFailureDiagnostics({
+            name: 'AI_APICallError',
+            cause: { name: 'AI_JSONParseError', text, cause: new SyntaxError(message) },
+        });
+        expect(result.parse).toEqual({ code, bytes: Buffer.byteLength(text) });
+        expect(JSON.stringify(result)).not.toContain('PRIVATE_PAYLOAD');
+        expect(JSON.stringify(result)).not.toContain('secret');
+        expect(providerFailureDiagnostics(new SyntaxError('Unexpected end of JSON input')).parse).toEqual({
+            code: 'unexpected_end',
+            bytes: null,
+        });
+    });
     it('bounds diagnostics and excludes arbitrary messages, field names and values', () => {
         const secret = 'sensitive-value';
         const error = {
@@ -1685,6 +1706,61 @@ describe('one coherent investigation and one independent check', () => {
             events.filter((event) => event.kind === 'assessment_progress').flatMap((event) => event.data.newlyAccepted),
         ).toHaveLength(20);
     });
+    it('resets recovery after each successful request and preserves accepted assessments', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        const prepared = await createPreparedFixture(20);
+        directories.push(prepared.state.artifact.repository);
+        const failedRequests = new Set<string>();
+        const wire = fixtureWire(prepared, 'openrouter', {
+            mutate(phase, payload, n) {
+                if (phase === 'assess')
+                    payload.assessments = n === 1 ? payload.assessments.slice(0, 17) : payload.assessments.slice(17);
+            },
+        });
+        const result = await runReview({
+            ...fixtureOptions(prepared),
+            fetch: async (url, init) => {
+                const request = String(init?.body);
+                if (phaseRequest(JSON.parse(request), prepared).phase === 'assess' && !failedRequests.has(request)) {
+                    failedRequests.add(request);
+                    return new Response('{"__proto__":{},"PRIVATE_PAYLOAD":"never log this"}', {
+                        headers: { 'content-type': 'application/json' },
+                    });
+                }
+                return wire(url, init);
+            },
+        });
+        expect(failedRequests.size).toBe(3);
+        expect(result.state.verification.verified).toBe(20);
+        expect(result.state.execution.calls).toBe(7);
+        const log = readFileSync(join(result.directory, 'diagnostics.jsonl'), 'utf8');
+        const events = log
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line));
+        expect(events.filter((event) => event.kind === 'provider_retry').map((event) => event.data)).toMatchObject([
+            {
+                count: 1,
+                call: 1,
+                retryScope: 'request',
+                backoffMs: 250,
+                parse: { code: 'prototype_property_rejected' },
+            },
+            { count: 1, call: 3, retryScope: 'request', backoffMs: 250 },
+            { count: 1, call: 5, retryScope: 'request', backoffMs: 250 },
+        ]);
+        expect(events.filter((event) => event.kind === 'provider_recovered').map((event) => event.data.call)).toEqual([
+            2, 4, 6,
+        ]);
+        expect(
+            events.filter((event) => event.kind === 'assessment_progress').flatMap((event) => event.data.newlyAccepted),
+        ).toHaveLength(20);
+        expect(
+            events.filter((event) => event.kind === 'tool_started' && event.data.tool === 'read_source'),
+        ).toHaveLength(1);
+        expect(log).not.toContain('PRIVATE_PAYLOAD');
+        expect(log).not.toContain('never log this');
+    });
     it.each([401, 402, 403, 400, 429, 503])('bounds provider recovery for HTTP %s', async (status) => {
         vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
         const prepared = await preparedFixture();
@@ -1723,6 +1799,13 @@ describe('one coherent investigation and one independent check', () => {
         expect(fetch).toHaveBeenCalledTimes(3);
         expect(result.state.decision?.exitCode).toBe(2);
         expect(result.state.verification.verified).toBe(0);
+        const events = readFileSync(join(result.directory, 'diagnostics.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line));
+        expect(events.filter((event) => event.kind === 'provider_retry_exhausted')).toMatchObject([
+            { data: { count: 2, call: 3, retryScope: 'request', parse: { code: 'unexpected_token' } } },
+        ]);
     });
     it('honors the original deadline before sending a recovery request', async () => {
         vi.stubEnv('OPENROUTER_API_KEY', 'test-key');

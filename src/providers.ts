@@ -99,10 +99,22 @@ function diagnosticType(value: unknown, available: boolean) {
     return Array.isArray(value) ? 'array' : typeof value;
 }
 
+/** Map parser messages to fixed categories; never retain the message or rejected text. */
+function parseFailure(cause: Record<string, unknown>) {
+    const message = typeof cause.message === 'string' ? cause.message : '';
+    if (message === 'Object contains forbidden prototype property') return 'prototype_property_rejected';
+    if (message === 'Unexpected end of JSON input') return 'unexpected_end';
+    if (message.startsWith('Unterminated string')) return 'unterminated_string';
+    if (message.startsWith('Bad control character')) return 'invalid_control_character';
+    if (message.startsWith('Unexpected token')) return 'unexpected_token';
+    return 'syntax_error';
+}
 /** Capture schema failures without copying exception messages, response values or arbitrary field names. */
 export function providerFailureDiagnostics(error: unknown) {
     const causes: string[] = [];
     const validation: Array<{ code: string; path: Array<string | number>; expected: string; actual: string }> = [];
+    let parse: { code: string; bytes: number | null } | undefined;
+    let rejectedBytes: number | null = null;
     let value: unknown;
     let hasValue = false;
     const collect = (issues: unknown, depth = 0) => {
@@ -126,6 +138,9 @@ export function providerFailureDiagnostics(error: unknown) {
     for (let depth = 0; current && typeof current === 'object' && depth < 5; depth++) {
         const cause = current as Record<string, unknown>;
         causes.push(typeof cause.name === 'string' && categories.has(cause.name) ? cause.name : 'other');
+        if (cause.name === 'AI_JSONParseError' && typeof cause.text === 'string')
+            rejectedBytes = Buffer.byteLength(cause.text, 'utf8');
+        if (cause.name === 'SyntaxError') parse = { code: parseFailure(cause), bytes: rejectedBytes };
         if (cause.name === 'AI_TypeValidationError' && 'value' in cause) {
             value = cause.value;
             hasValue = true;
@@ -133,29 +148,39 @@ export function providerFailureDiagnostics(error: unknown) {
         collect(cause.issues);
         current = cause.cause;
     }
-    return { causes, validation };
+    return { causes, validation, ...(parse ? { parse } : {}) };
 }
 
 /** Retry only failed provider operations, before any response tools execute. */
 export function recoverProviderCalls(
     model: Parameters<typeof wrapLanguageModel>[0]['model'],
     signal: AbortSignal,
-    onRetry: (retry: number, error: unknown) => Promise<unknown>,
+    onRecovery: (
+        event: 'provider_retry' | 'provider_recovered' | 'provider_retry_exhausted',
+        retry: number,
+        error?: unknown,
+    ) => Promise<unknown>,
 ): ReturnType<typeof wrapLanguageModel> {
-    let retries = 0;
     return wrapLanguageModel({
         model,
         middleware: {
             specificationVersion: 'v4',
             wrapGenerate: async ({ doGenerate }) => {
+                let retries = 0;
                 for (;;) {
                     signal.throwIfAborted();
                     try {
-                        return await doGenerate();
+                        const response = await doGenerate();
+                        if (retries) await onRecovery('provider_recovered', retries);
+                        return response;
                     } catch (error) {
-                        if (signal.aborted || retries >= 2 || !recoverableProviderError(error)) throw error;
+                        if (signal.aborted || !recoverableProviderError(error)) throw error;
+                        if (retries >= 2) {
+                            await onRecovery('provider_retry_exhausted', retries, error);
+                            throw error;
+                        }
                         retries++;
-                        await onRetry(retries, error);
+                        await onRecovery('provider_retry', retries, error);
                         await delay(250 * 2 ** (retries - 1), undefined, { signal });
                     }
                 }
@@ -163,6 +188,7 @@ export function recoverProviderCalls(
         },
     });
 }
+
 function recoverableProviderError(error: unknown): boolean {
     // Our usage reader parses the same response before the SDK; malformed JSON can surface here directly.
     if (error instanceof SyntaxError) return true;

@@ -1,6 +1,6 @@
 {
     "name": "@contextrail/code-review-agent",
-    "version": "1.0.0-alpha.8",
+    "version": "1.0.0-alpha.9",
     "description": "Review Git changes against your published organizational guidance and inspect findings with source evidence.",
     "type": "module",
     "main": "dist/index.js",
@@ -12,6 +12,7 @@
         "dist/*.js",
         "dist/*.d.ts",
         "README.md",
+        "docs/*.md",
         "examples/review-pull-request.yml"
     ],
     "engines": {
