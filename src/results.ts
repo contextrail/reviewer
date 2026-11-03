@@ -102,9 +102,37 @@ function resultGate(result: ResultSlot, policy: ReviewPolicy) {
     return null;
 }
 
+type PolicyFinding = { verified: boolean; classification: string; assessmentIds: string[] };
+type PolicyReason = { assessmentId: string | null; gate: string; blocking: boolean };
+
+function addFindingReasons(
+    entries: ReviewEntry[],
+    findings: PolicyFinding[],
+    policy: ReviewPolicy,
+    reasons: PolicyReason[],
+) {
+    for (const finding of findings) {
+        if (!finding.verified || !['binding_violation', 'behavioral_defect'].includes(finding.classification)) continue;
+        for (const id of finding.assessmentIds) {
+            if (
+                !entries.some((entry) => entry.assessmentId === id) ||
+                reasons.some((reason) => reason.assessmentId === id && reason.gate === finding.classification)
+            )
+                continue;
+            reasons.push({ assessmentId: id, gate: finding.classification, blocking: !policy.advisory });
+        }
+    }
+}
+
 /** Judgment is unchanged; only deterministic automation policy is applied here. */
-export function decideExit(entries: ReviewEntry[], policy: ReviewPolicy, incomplete = false, executionFailure = false) {
-    const reasons: Array<{ assessmentId: string | null; gate: string; blocking: boolean }> = [];
+export function decideExit(
+    entries: ReviewEntry[],
+    policy: ReviewPolicy,
+    incomplete = false,
+    executionFailure = false,
+    findings: PolicyFinding[] = [],
+) {
+    const reasons: PolicyReason[] = [];
     let blocker = false;
     for (const entry of entries) {
         const gate = resultGate(entry.result, policy);
@@ -114,6 +142,8 @@ export function decideExit(entries: ReviewEntry[], policy: ReviewPolicy, incompl
         blocker ||= blocking;
         reasons.push({ assessmentId: entry.assessmentId, gate: gate.name, blocking });
     }
+    addFindingReasons(entries, findings, policy, reasons);
+    blocker ||= reasons.some((reason) => reason.blocking);
     const reviewExit = blocker ? 1 : incomplete ? 2 : 0;
     // An execution/report failure is separate from the established review judgment.
     const exitCode = executionFailure ? 2 : reviewExit;

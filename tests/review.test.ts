@@ -19,7 +19,7 @@ import { runReview } from '../src/review.js';
 import { loadReviewCheckpoint } from '../src/resume.js';
 import { createPhaseRecord } from '../src/phases.js';
 import { FixedSnapshotSource } from '../src/source.js';
-import { renderActionSummary } from '../src/presentation.js';
+import { renderActionSummary, assessmentCoverage } from '../src/presentation.js';
 import type { Publication, PublishedReader } from '../src/contracts.js';
 import { providerFailureDiagnostics, type ReviewProvider } from '../src/providers.js';
 
@@ -1831,6 +1831,257 @@ describe('one coherent investigation and one independent check', () => {
         expect(result.state.verification.verified).toBe(0);
         expect(result.state.phases.map((p) => p.phase)).toEqual(['assess']);
     });
+    it('publishes supported findings even when the same criterion has a separate evidence gap', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        const prepared = await createPreparedFixture();
+        directories.push(prepared.state.artifact.repository);
+        const result = await runReview({
+            ...fixtureOptions(prepared),
+            fetch: fixtureWire(prepared, 'openrouter', {
+                mutate(phase, payload) {
+                    if (phase !== 'verify') return;
+                    for (const entry of payload.entries) {
+                        entry.disposition = 'revise';
+                        entry.reason = 'The disclosure finding is supported; runtime behavior remains unverified.';
+                        entry.missingChecks = ['Supply runtime evidence for the separate affected path.'];
+                    }
+                },
+            }),
+        });
+        expect(result.state.findings.length).toBeGreaterThan(0);
+        expect(result.state.findings.every((finding) => finding.verified)).toBe(true);
+        expect(result.state.entries.every((entry) => entry.result.disposition === 'unresolved')).toBe(true);
+        expect(result.state.entries[0]!.result).toMatchObject({
+            correction: 'Supply runtime evidence for the separate affected path.',
+            confidence: null,
+        });
+        expect(result.state.entries[0]!.result.correction).not.toBe('Restore authorization before return.');
+        expect(result.state.decision).toMatchObject({ exitCode: 1, complete: false });
+        expect(() => validatePublicationArtifacts(result.directory, result.state, result.statePath)).not.toThrow();
+    });
+    it('applies an evidenced verifier correction without another model phase or retained rejected claims', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        const prepared = await createPreparedFixture();
+        directories.push(prepared.state.artifact.repository);
+        const result = await runReview({
+            ...fixtureOptions(prepared),
+            fetch: fixtureWire(prepared, 'openrouter', {
+                mutate(phase, payload) {
+                    if (phase !== 'verify') return;
+                    for (const entry of payload.entries) {
+                        entry.disposition = 'revise';
+                        entry.reason = 'The proposed requirement does not apply to this documented permitted path.';
+                        entry.findings.forEach((finding) => {
+                            finding.accepted = false;
+                            finding.suggestionAccepted = false;
+                        });
+                        entry.resolution = {
+                            ...submissions(prepared).find((result) => result.assessmentId === entry.assessmentId)!,
+                            finding: 'none',
+                            adherence: 2,
+                            confidence: 3,
+                            explanation: 'The governing rule permits this inspected path.',
+                            consequence: '',
+                            correction: '',
+                            limitations: ['Source inspection only.'],
+                            confidenceReason: 'Independently inspected the permitted path and governing rule.',
+                        };
+                    }
+                },
+            }),
+        });
+        expect(result.state.decision).toMatchObject({ exitCode: 0, complete: true });
+        expect(result.state.findings).toEqual([]);
+        expect(
+            result.state.entries.every(
+                (entry) => entry.result.explanation === 'The governing rule permits this inspected path.',
+            ),
+        ).toBe(true);
+        expect(result.state.phases.map((phase) => phase.phase)).toEqual(['assess', 'verify']);
+        expect(assessmentCoverage(result.state)).toMatchObject({ verified: 2, needsReassessment: 0 });
+        expect(() => validatePublicationArtifacts(result.directory, result.state, result.statePath)).not.toThrow();
+        // The rejected proposal remains in the immutable assess handoff for audit.
+        expect(JSON.stringify(result.state.phases[0]!.output)).toContain('Unauthorized disclosure');
+    });
+    it.each(['missed-defect', 'reclassified'])(
+        'publishes verifier amendments after a provider retry: %s',
+        async (kind) => {
+            vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+            const prepared = await createPreparedFixture();
+            directories.push(prepared.state.artifact.repository);
+            const wire = fixtureWire(prepared, 'openrouter', {
+                mutate(phase, payload) {
+                    if (phase === 'assess' && kind === 'missed-defect') {
+                        for (const assessment of payload.assessments) {
+                            assessment.result.finding = 'none';
+                            assessment.result.adherence = 2;
+                            assessment.findings = [];
+                        }
+                    }
+                    if (phase !== 'verify') return;
+                    for (const entry of payload.entries) {
+                        entry.disposition = 'revise';
+                        entry.reason = 'Independent source inspection corrects the original assessment.';
+                        entry.findings.forEach((finding) => {
+                            finding.accepted = false;
+                            finding.suggestionAccepted = false;
+                            finding.explanation = 'Superseded by the corrected assessment.';
+                        });
+                        const amendment = jointInput(prepared, [entry.assessmentId]).assessments[0]!;
+                        entry.amendment = amendment as NonNullable<typeof entry.amendment>;
+                        if (kind === 'reclassified') {
+                            entry.amendment.result.finding = 'guidance_departure';
+                            entry.amendment.result.adherence = 1;
+                            entry.amendment.findings[0]!.classification = 'guidance_departure';
+                            entry.amendment.findings[0]!.explanation = 'The inspected departure is discretionary.';
+                        }
+                    }
+                },
+            });
+            let failedRequest: string | undefined;
+            let recovered = false;
+            const result = await runReview({
+                ...fixtureOptions(prepared),
+                fetch: async (url, init) => {
+                    if (phaseRequest(JSON.parse(String(init?.body)), prepared).phase === 'verify') {
+                        if (!failedRequest) {
+                            failedRequest = String(init?.body);
+                            return new Response('{"__proto__":{}}', {
+                                headers: { 'content-type': 'application/json' },
+                            });
+                        }
+                        expect(String(init?.body)).toBe(failedRequest);
+                        recovered = true;
+                    }
+                    return wire(url, init);
+                },
+            });
+            expect(recovered).toBe(true);
+            expect(result.state.decision).toMatchObject({ exitCode: kind === 'missed-defect' ? 1 : 0, complete: true });
+            expect(result.state.findings.length).toBeGreaterThan(0);
+            expect(result.state.findings.every((f) => f.verified && !f.proposedReplacement)).toBe(true);
+            expect(
+                result.state.findings.every(
+                    (f) => f.classification === (kind === 'missed-defect' ? 'binding_violation' : 'guidance_departure'),
+                ),
+            ).toBe(true);
+            expect(result.state.phases.map((p) => p.phase)).toEqual(['assess', 'verify']);
+            expect(assessmentCoverage(result.state)).toMatchObject({ verified: 2, needsReassessment: 0 });
+            expect(() => validatePublicationArtifacts(result.directory, result.state, result.statePath)).not.toThrow();
+            const git = (...args: string[]) =>
+                execFileSync('git', ['-C', prepared.state.artifact.repository, ...args], { encoding: 'utf8' });
+            const inline = buildInlineReview(
+                result.state,
+                JSON.parse(readFileSync(join(result.directory, 'evidence.json'), 'utf8')),
+                {
+                    diff: git(
+                        'diff',
+                        '--no-ext-diff',
+                        '--no-textconv',
+                        prepared.state.artifact.base.commit,
+                        prepared.state.artifact.head.commit,
+                    ),
+                    source: (side, path) => {
+                        const commit = prepared.state.artifact[side].commit;
+                        return {
+                            blob: git('rev-parse', `${commit}:${path}`).trim(),
+                            text: git('show', `${commit}:${path}`),
+                        };
+                    },
+                },
+            );
+            expect(inline.comments).toHaveLength(kind === 'missed-defect' ? 1 : 0);
+            if (kind === 'missed-defect') {
+                expect(inline.comments[0]!.body).toContain('Authorization missing');
+                expect(inline.comments[0]!.body).not.toContain('```suggestion');
+            } else {
+                expect(renderActionSummary(result.state)).toContain('The inspected departure is discretionary');
+            }
+            const original = result.state.phases[0]!.output as AssessmentProposal[];
+            expect(original.every((p) => p.findings.length === (kind === 'missed-defect' ? 0 : 1))).toBe(true);
+        },
+    );
+    it.each([
+        'missing-source',
+        'foreign-check',
+        'foreign-identity',
+        'unchecked-patch',
+        'missing-check',
+        'conflicting-decision',
+    ])('rejects unsafe verifier amendments: %s', async (kind) => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        const prepared = await preparedFixture();
+        const result = await runReview({
+            ...fixtureOptions(prepared),
+            fetch: fixtureWire(prepared, 'openrouter', {
+                mutate(phase, payload) {
+                    if (phase !== 'verify') return;
+                    for (const entry of payload.entries) {
+                        entry.disposition = 'revise';
+                        entry.findings.forEach((f) => {
+                            f.accepted = kind === 'conflicting-decision';
+                            f.suggestionAccepted = false;
+                        });
+                        entry.amendment = jointInput(prepared, [entry.assessmentId]).assessments[0]! as NonNullable<
+                            typeof entry.amendment
+                        >;
+                        const finding = entry.amendment.findings[0]!;
+                        if (kind === 'missing-source') finding.locationRefs = [entry.amendment.result.citations[0]!];
+                        if (kind === 'foreign-check') finding.checkIndices = [999];
+                        if (kind === 'foreign-identity') entry.amendment.result.assessmentId = 'foreign';
+                        if (kind === 'missing-check') entry.missingChecks = ['Required evidence remains unavailable.'];
+                        if (kind === 'unchecked-patch')
+                            finding.proposedReplacement = {
+                                path: 'route.ts',
+                                blob: 'untrusted',
+                                startLine: 1,
+                                endLine: 1,
+                                before: 'before',
+                                replacement: 'after',
+                            };
+                    }
+                },
+            }),
+        });
+        expect(result.state.verification.verified).toBe(0);
+        expect(result.state.decision?.exitCode).toBe(2);
+        expect(result.state.findings.some((f) => f.verified)).toBe(false);
+    });
+    it.each(['missing-check', 'accepted-finding', 'foreign-identity'])(
+        'rejects an inconsistent verifier resolution: %s',
+        async (kind) => {
+            vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+            const prepared = await preparedFixture();
+            const result = await runReview({
+                ...fixtureOptions(prepared),
+                fetch: fixtureWire(prepared, 'openrouter', {
+                    mutate(phase, payload) {
+                        if (phase !== 'verify') return;
+                        for (const entry of payload.entries) {
+                            entry.disposition = 'revise';
+                            entry.missingChecks =
+                                kind === 'missing-check' ? ['Missing decisive execution evidence.'] : [];
+                            entry.findings.forEach((finding) => {
+                                finding.accepted = kind === 'accepted-finding';
+                                finding.suggestionAccepted = false;
+                            });
+                            entry.resolution = {
+                                ...submissions(prepared).find((result) => result.assessmentId === entry.assessmentId)!,
+                                assessmentId: kind === 'foreign-identity' ? 'foreign' : entry.assessmentId,
+                                finding: 'none',
+                                adherence: 2,
+                                correction: '',
+                                consequence: '',
+                            };
+                        }
+                    },
+                }),
+            });
+            expect(result.state.decision?.exitCode).toBe(2);
+            expect(result.state.verification.verified).toBe(0);
+            expect(result.state.findings.some((finding) => finding.verified)).toBe(false);
+        },
+    );
     it('does not semantically rerun a rejected assessment or invoke a second verifier', async () => {
         vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
         const prepared = await preparedFixture();

@@ -40,7 +40,7 @@ export const assessmentSchema = z.strictObject({
     ),
 });
 /** One investigation authors passage-backed checks together with each criterion judgment. */
-const reviewSubmissionSchema = z.strictObject({
+export const reviewSubmissionSchema = z.strictObject({
     assessments: z
         .array(
             z.strictObject({
@@ -85,7 +85,7 @@ export const reviewSelectionSchema = reviewSubmissionSchema.extend({
         .min(1)
         .max(1),
 });
-function validateReviewSubmission(
+export function validateReviewSubmission(
     input: unknown,
     entries: ReviewEntry[],
     ledger: EvidenceLedger,

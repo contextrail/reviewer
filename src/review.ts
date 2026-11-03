@@ -10,7 +10,7 @@ import { parsePrContext, type PrContext } from './pr-context.js';
 import { sendReviewReport, type ReportingStatus, type ReviewFeedbackSender } from './feedback.js';
 import { atomicJson, digest, structuredRequirements, type PreparedState } from './prepare.js';
 import { CitationError, EvidenceLedger, modelEvidence, resolveCitationSelections } from './evidence.js';
-import { DEFAULT_POLICY, decideExit, type ReviewEntry, type ReviewPolicy } from './results.js';
+import { DEFAULT_POLICY, decideExit, type ReviewEntry, type AcceptedResult, type ReviewPolicy } from './results.js';
 import {
     reviewModel,
     recoverProviderCalls,
@@ -1217,33 +1217,63 @@ function applyEntryVerification(
     proposal: AssessmentProposal,
     verification: VerificationEntry | undefined,
 ) {
-    const accepted = verification?.disposition === 'accept';
-    state.checks.push(...proposal.checks.map((check) => ({ ...check, verified: accepted })));
-    state.findings.push(
-        ...proposal.findings.map((finding) => {
-            const decision = verification?.findings.find((item) => item.findingId === finding.findingId);
-            return {
-                ...finding,
-                verified: accepted && decision?.accepted === true,
-                proposedReplacement: finding.proposedReplacement
-                    ? { ...finding.proposedReplacement, verified: accepted && decision?.suggestionAccepted === true }
-                    : undefined,
-            };
-        }),
-    );
-    if (accepted) {
-        entry.result = proposal.result;
+    if (verification?.amendment) {
+        state.checks.push(...verification.amendment.checks);
+        state.findings.push(...verification.amendment.findings);
+        entry.result = verification.amendment.result;
         state.verification.verified++;
         return;
     }
-    entry.result = {
+    const accepted = verification?.disposition === 'accept';
+    const resolution = verification?.resolution;
+    state.checks.push(...proposal.checks.map((check) => ({ ...check, verified: accepted })));
+    state.findings.push(
+        ...proposal.findings
+            .filter(
+                (finding) =>
+                    !verification ||
+                    verification.findings.some((item) => item.findingId === finding.findingId && item.accepted),
+            )
+            .map((finding) => {
+                const decision = verification?.findings.find((item) => item.findingId === finding.findingId);
+                return {
+                    ...finding,
+                    verified: decision?.accepted === true,
+                    proposedReplacement: finding.proposedReplacement
+                        ? {
+                              ...finding.proposedReplacement,
+                              verified: decision?.accepted === true && decision?.suggestionAccepted === true,
+                          }
+                        : undefined,
+                };
+            }),
+    );
+    if (accepted || resolution) {
+        entry.result = resolution ?? proposal.result;
+        state.verification.verified++;
+        return;
+    }
+    entry.result = unresolvedVerificationResult(proposal, verification);
+}
+function unresolvedVerificationResult(
+    proposal: AssessmentProposal,
+    verification: VerificationEntry | undefined,
+): AcceptedResult {
+    return {
         ...proposal.result,
         disposition: 'unresolved',
         adherence: null,
         confidence: null,
+        confidenceReason:
+            'The original assessment was not accepted; the verifier did not provide a resolved replacement.',
         finding: 'none',
+        consequence: 'This criterion remains incomplete; independently supported findings are reported separately.',
+        correction: verification?.missingChecks.length
+            ? verification.missingChecks.join(' ')
+            : 'Resolve the verifier’s stated objection against the governing evidence.',
+        citations: verification?.citations ?? [],
         explanation: verification?.reason ?? 'Independent verification did not complete.',
-        limitations: proposal.result.limitations.concat(verification?.missingChecks ?? ['Verification unavailable.']),
+        limitations: verification?.missingChecks ?? ['Verification unavailable.'],
     };
 }
 async function verifyRun(run: ReviewRuntime, assessments: AssessmentProposal[]) {
@@ -1257,7 +1287,7 @@ async function verifyRun(run: ReviewRuntime, assessments: AssessmentProposal[]) 
         state.entries,
         { ...baseReviewPayload(run), evidencePack: run.evidencePack!.index, proposals: selected },
         verificationSelectionSchema,
-        (value) => validateVerification(value, selected, ledger),
+        (value) => validateVerification(value, selected, ledger, state.entries, requirementsFor(run)),
         nextAttempt(run, 'verify'),
     );
     const verifications = new Map(output.map((verdict) => [verdict.assessmentId, verdict]));
@@ -1366,6 +1396,7 @@ async function finalizeReview(run: ReviewRuntime, executionFailure: boolean) {
         state.execution.policy,
         !state.verification.complete || state.preparationStatus !== 'prepared',
         executionFailure,
+        state.findings,
     );
     state.reviewStatus = state.decision.complete && !executionFailure ? 'complete' : 'incomplete';
     const reportPath = join(directory, 'report.json');

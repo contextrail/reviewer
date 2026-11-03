@@ -1054,9 +1054,10 @@ function acceptedOriginalFindings(id: string, handoffs: PublicationHandoffs): Re
         verification = handoffs.verifications.get(id);
     const origin = handoffs.proposalOrigins.get(id),
         verifier = handoffs.verificationOrigins.get(id);
-    if (verification?.disposition !== 'accept') return [];
+    if (!verification) return [];
     if (!proposal || !origin || !verifier?.inputRefs.some((ref) => ref.ref === origin.ref && ref.hash === origin.hash))
         return fail('publication_stale_verification');
+    if (verification.amendment) return objects(object(verification.amendment).findings) as unknown as ReviewFinding[];
     return objects(proposal.findings).flatMap((original) => {
         const decision = objects(verification.findings).find((finding) => finding.findingId === original.findingId);
         if (decision?.accepted !== true) return [];
@@ -1088,9 +1089,16 @@ function verifyPublishedJudgments(
         const expected = canonical.find((original) => original.findingId === finding.findingId);
         if (!expected || digest(expected) !== digest(finding)) fail('publication_finding_unverified');
     }
+    for (const entry of objects(state.entries)) {
+        const resolution = handoffs.verifications.get(string(entry.assessmentId))?.resolution;
+        if (resolution && digest(resolution) !== digest(entry.result)) fail('publication_resolution_changed');
+    }
     if (
         object(state.verification).complete === true &&
-        actualIds.some((id) => handoffs.verifications.get(string(id))?.disposition !== 'accept')
+        actualIds.some((id) => {
+            const verdict = handoffs.verifications.get(string(id));
+            return verdict?.disposition !== 'accept' && object(verdict?.resolution).assessmentId !== id;
+        })
     )
         fail('publication_coverage_unverified');
 }

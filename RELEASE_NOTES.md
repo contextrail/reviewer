@@ -1,6 +1,6 @@
-## 1.0.0-alpha.7 (2026-11-03)
+## 1.0.0-alpha.8 (2026-11-03)
 
-### Features
+### Fixes and improvements
 
-* **reviewer:** allow retry for sdk errors 45fa0c8
+* **reviewer:** fix harness retries 1653e05
 

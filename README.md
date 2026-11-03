@@ -36,10 +36,10 @@ an instruction-only reviewer cannot supply this CLI's assessment scope.
 
 Install an exact published version from public npm (alpha versions use npm's `alpha` channel).
 The package is Apache-2.0 licensed. This source checkout's selected version is
-`1.0.0-alpha.7`; its immutable export attribution is in `release.json`.
+`1.0.0-alpha.8`; its immutable export attribution is in `release.json`.
 
 ```sh
-npm install --ignore-scripts @contextrail/code-review-agent@1.0.0-alpha.7
+npm install --ignore-scripts @contextrail/code-review-agent@1.0.0-alpha.8
 ./node_modules/.bin/contextrail-review --help
 ```
 
@@ -336,7 +336,7 @@ Select an independently reviewed public Action SHA and an exact qualified npm ve
 ```yaml
 - uses: contextrail/reviewer/action@ACTION_COMMIT_SHA
   with:
-      package-version: '1.0.0-alpha.7'
+      package-version: '1.0.0-alpha.8'
       pr-number: ${{ github.event.pull_request.number }}
       base-branch: alpha
       reviewer: skill://your-domain/your-reviewer
@@ -464,8 +464,20 @@ The evidence pack focuses the review on all selected standards and prerequisites
 in either pinned Git snapshot, including unchanged supporting code. Pack read tools expose governing
 text with numbered citation segments; source read, list and search tools provide additional evidence.
 The package keeps every original criterion as a result row without creating a session per criterion.
-The independent final check evaluates the resulting set together. Missing results, unsupported
-claims and failed verification remain explicit incomplete work.
+The independent final check evaluates the resulting set together. It can supply an evidence-backed
+corrected criterion result in the same pass; the original proposal and correction remain in their
+separate immutable phase records. Rejecting a finding alone never establishes a clean result.
+Supported findings are accepted individually even when another obligation in that criterion remains
+unresolved; rejected findings stay in the audit handoff rather than the published finding list.
+Missing decisive checks remain unresolved. Their current explanation, correction and citations come
+from verification, without retaining contradictory proposal text. A supported blocking finding still
+blocks while completeness is reported separately. No additional assessor/verifier loop is introduced.
+For missed defects or incorrect classifications, the verifier can submit a complete amended criterion
+assessment with governing checks, source evidence and the final finding list. The amendment supersedes
+the original criterion's findings, so it must retain all still-supported findings. Both versions remain
+in their immutable phase records. The existing assessment validator checks its scope, citations,
+check links and aggregate judgment. Amended findings can produce inline comments, but cannot carry
+one-click code replacements because they have not had a separate patch verification.
 
 Developer feedback groups verified accounts with overlapping ranges in the same pinned source into one
 thread while retaining every distinct conclusion, correction and governing criterion. This does

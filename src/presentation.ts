@@ -353,7 +353,10 @@ function recordVerification(phase: PhaseRecord, handoffs: CoverageHandoffs) {
         const id = string(outcome.assessmentId),
             origin = handoffs.current.get(id);
         if (origin && phase.inputRefs.some((r) => r.ref === origin.ref && r.hash === origin.hash))
-            handoffs.verification.set(id, string(outcome.disposition));
+            handoffs.verification.set(
+                id,
+                object(outcome.resolution).assessmentId === id ? 'accept' : string(outcome.disposition),
+            );
     }
 }
 function coverageStatus(entry: Record<string, unknown>, verified: number, handoffs: CoverageHandoffs): string {
@@ -520,7 +523,7 @@ function criterionRow(
     const linked = verified.filter(
         (f) => Array.isArray(f.assessmentIds) && f.assessmentIds.includes(entry.assessmentId),
     );
-    const count = accepted && linked.length ? `[${linked.length}](#governed-findings)` : '0';
+    const count = linked.length ? `[${linked.length}](#governed-findings)` : '0';
     return `| ${markdownText(entry.nodeId, 500)} @ ${markdownText(entry.version, 20)} | ${criterionOutcome(result, accepted)} | ${verificationLabels[status] ?? 'Not checked'} | ${count} | ${markdownText(criterionNote(result, status, accepted), 200)} |`;
 }
 function findingCriteria(accounts: Record<string, unknown>[], entries: Record<string, unknown>[]): string {
