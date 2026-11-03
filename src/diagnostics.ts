@@ -58,6 +58,21 @@ const fields = new Set([
     'newlyAccepted',
     'alreadyAccepted',
     'remaining',
+    'request',
+    'requestBytes',
+    'messageCount',
+    'toolCount',
+    'toolSchemaBytes',
+    'maxOutputTokens',
+    'requestFormat',
+    'reason',
+    'parameter',
+    'evidence',
+    'bodyFormat',
+    'transport',
+    'stage',
+    'primaryStopReason',
+    'systemCode',
 ]);
 const secretValues = () =>
     Object.entries(process.env)
@@ -100,8 +115,31 @@ function bounded(value: unknown, depth = 0, arrayLimit = 32): unknown {
         );
     return null;
 }
+/** Fixed operating-system categories; no paths or exception messages leave the process. */
+export function systemFailureDiagnostics(error: unknown): { systemCode: string | null } {
+    const codes: Record<string, string> = {
+        EACCES: 'filesystem_permission_denied',
+        EPERM: 'filesystem_permission_denied',
+        ENOSPC: 'filesystem_storage_full',
+        EDQUOT: 'filesystem_quota_exceeded',
+        ENOENT: 'filesystem_path_missing',
+        ENOTDIR: 'filesystem_path_invalid',
+        EISDIR: 'filesystem_path_invalid',
+        EROFS: 'filesystem_read_only',
+        EMFILE: 'filesystem_open_limit',
+        ENFILE: 'filesystem_open_limit',
+    };
+    let current = error;
+    for (let depth = 0; current && typeof current === 'object' && depth < 5; depth++) {
+        const code = ownData(current, 'code');
+        if (typeof code === 'string' && Object.hasOwn(codes, code)) return { systemCode: codes[code]! };
+        current = ownData(current, 'cause');
+    }
+    return { systemCode: null };
+}
 export class Diagnostics {
     private writes = Promise.resolve();
+    private writeFailed = false;
     constructor(
         readonly directory: string,
         readonly runId: string,
@@ -113,7 +151,9 @@ export class Diagnostics {
         const operation = this.writes.then(() =>
             appendFile(join(this.directory, 'diagnostics.jsonl'), JSON.stringify(record) + '\n', { mode: 0o600 }),
         );
-        this.writes = operation.catch(() => undefined);
+        this.writes = operation.catch(() => {
+            this.writeFailed = true;
+        });
         if (
             kind.endsWith('_failed') ||
             kind === 'execution_stopped' ||
@@ -123,17 +163,26 @@ export class Diagnostics {
                     'phase_started',
                     'phase_completed',
                     'phase_failed',
+                    'provider_started',
+                    'provider_completed',
+                    'assessment_progress',
+                    'review_reporting',
                     'provider_retry',
                     'provider_recovered',
                     'provider_retry_exhausted',
                     'review_finalized',
                 ].includes(kind))
         )
-            this.log(JSON.stringify(record) + '\n');
+            try {
+                this.log(JSON.stringify(record) + '\n');
+            } catch {
+                this.writeFailed = true;
+            }
         return operation;
     }
-    flush() {
-        return this.writes;
+    async flush() {
+        await this.writes;
+        if (this.writeFailed) throw new Error('diagnostic_write_failed');
     }
 }
 

@@ -27,29 +27,99 @@ function reviewState(root, config, fixed) {
         return { directory: null, state: null };
     }
 }
+function terminalDiagnostic(events) {
+    const stopIndex = events.findLastIndex((event) => event.kind === 'execution_stopped');
+    if (stopIndex < 0) return null;
+    const stopped = events[stopIndex].data ?? {};
+    const beforeStop = events.slice(0, stopIndex);
+    const phaseStart = beforeStop.findLastIndex((event) => event.kind === 'phase_started');
+    const phaseEvents = beforeStop.slice(Math.max(0, phaseStart));
+    const failedPhase = phaseEvents.findLast((event) => event.kind === 'phase_failed')?.data;
+    // A later successful request, recovery, or new request must not blame an earlier failure.
+    const provider = phaseEvents.findLast((event) =>
+        [
+            'provider_started',
+            'provider_failed',
+            'provider_completed',
+            'provider_recovered',
+            'provider_accounting_failed',
+        ].includes(event.kind),
+    );
+    const samePhase =
+        provider?.data?.phase === failedPhase?.phase &&
+        provider?.data?.attempt === failedPhase?.attempt &&
+        provider?.data?.workUnitId === failedPhase?.workUnitId;
+    const responseRejected = (stopped.details?.causes ?? []).some((code) =>
+        ['AI_JSONParseError', 'AI_TypeValidationError'].includes(code),
+    );
+    const terminalProvider =
+        failedPhase?.code === 'provider_or_execution_failed' &&
+        (provider?.kind === 'provider_failed' || (provider?.kind === 'provider_completed' && responseRejected)) &&
+        samePhase
+            ? provider.data
+            : {};
+    return {
+        ...terminalProvider,
+        ...stopped,
+        code: terminalProvider.code ?? stopped.code,
+        phase: failedPhase?.phase,
+        details: stopped.details,
+        failureDetails: terminalProvider.details,
+    };
+}
+function diagnosticLines(text) {
+    const events = [];
+    let incomplete = false;
+    for (const line of text.trim().split('\n')) {
+        try {
+            const event = JSON.parse(line);
+            if (event && typeof event === 'object' && typeof event.kind === 'string') events.push(event);
+            else incomplete = true;
+        } catch {
+            incomplete = true;
+        }
+    }
+    return { events, incomplete };
+}
 function readStopDiagnostic(directory, name) {
     try {
-        const stopped = readFileSync(join(directory, name), 'utf8')
-            .trim()
-            .split('\n')
-            .map((line) => JSON.parse(line))
-            .findLast((event) => event.kind === 'execution_stopped');
-        return stopped ? stopDiagnostic(stopped) : null;
+        const { events, incomplete } = diagnosticLines(readFileSync(join(directory, name), 'utf8'));
+        const data = terminalDiagnostic(events);
+        const finalization = events.findLast((event) => event.kind === 'finalization_failed')?.data;
+        const parts = [data ? stopDiagnostic(data) : ''];
+        if (finalization)
+            parts.push(
+                `Finalization failed: ${diagnosticLabel(finalization.code)}; stage ${diagnosticLabel(finalization.stage)}.`,
+            );
+        if (incomplete) parts.push('Diagnostic evidence incomplete: malformed records omitted.');
+        return parts.filter(Boolean).join(' ') || null;
     } catch {
         // Missing or malformed diagnostics do not establish success.
         return null;
     }
 }
-function stopDiagnostic(stopped) {
-    const data = stopped.data ?? {};
-    const header = `Failure: ${data.category ?? 'unknown'}; HTTP ${data.status ?? 'unknown'}; call ${data.call ?? 'unknown'}.`;
+const diagnosticLabel = (value) =>
+    typeof value === 'string' && /^[a-zA-Z0-9_.-]{1,100}$/u.test(value) ? value : 'unknown';
+const diagnosticNumber = (value) => (Number.isFinite(value) && value >= 0 ? value : 'unknown');
+function stopDiagnostic(data) {
+    const header = `Failure: ${diagnosticLabel(data.code ?? data.category)}; HTTP ${diagnosticNumber(data.status)}; call ${diagnosticNumber(data.call)}.`;
+    const context = [
+        data.phase ? ` Phase ${diagnosticLabel(data.phase)}.` : '',
+        data.failureDetails?.reason ? ` Provider reason ${diagnosticLabel(data.failureDetails.reason)}.` : '',
+        data.failureDetails?.parameter ? ` Parameter ${diagnosticLabel(data.failureDetails.parameter)}.` : '',
+        data.failureDetails?.transport ? ` Transport ${diagnosticLabel(data.failureDetails.transport)}.` : '',
+        Number.isFinite(data.request?.requestBytes)
+            ? ` Request ${diagnosticNumber(data.request.requestBytes)} bytes.`
+            : '',
+        Number.isFinite(data.elapsedMs) ? ` Request duration ${diagnosticNumber(data.elapsedMs)} ms.` : '',
+    ].join('');
     const issues = (data.details?.validation ?? [])
         .slice(0, 3)
         .map(
             (issue) =>
                 ` Validation ${issue.code} at ${Array.isArray(issue.path) ? issue.path.join('.') : 'unknown'}: expected ${issue.expected}, actual ${issue.actual}.`,
         );
-    return header + issues.join('');
+    return header + context + issues.join('');
 }
 function diagnosticForRun(directory, state) {
     if (!directory || state?.execution?.stopReason === 'finished') return '';

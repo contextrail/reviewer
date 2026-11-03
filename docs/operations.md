@@ -76,6 +76,48 @@ it, otherwise null. These categories distinguish observed parser failures withou
 exception messages, response bodies, prompts, source or arbitrary provider fields. Unknown
 syntax details remain unknown rather than being inferred from a generic exception name.
 
+### Diagnose a failed run
+
+Start with the Action summary's terminal failure, then open `diagnostics.jsonl` in the
+artifact. Correlate events by run ID, phase, attempt and call. The summary links the stop
+reason to the last failing provider request in that phase; a recovered earlier error is
+not the final cause. Updated summary behavior requires the new Action SHA as well as the
+new npm package; changing `REVIEWER_VERSION` alone does not update Action scripts.
+
+At `info`, phase boundaries, provider request start/completion, assessment progress,
+recovery, reporting and final outcome appear on stderr. `debug` also shows tool activity,
+submission diagnostics and SDK steps. `quiet` retains artifacts and prints fatal failures.
+All levels write the same bounded diagnostic artifact; stdout remains machine JSON.
+
+Provider start/completion/failure events include request bytes, message and tool counts,
+tool-schema bytes and the explicit output-token limit when available. These are wire
+measurements, not token estimates. Request structure is inspected only up to 4 MiB;
+above that size the byte count remains available but structural counts are unknown.
+HTTP completion describes receipt and usage capture, not successful SDK parsing or a
+valid review. Tool and phase terminal events record duration too.
+
+| Failure category                                          | What to check next                                        | Automatic recovery                                   |
+| --------------------------------------------------------- | --------------------------------------------------------- | ---------------------------------------------------- |
+| Context limit or oversized request                        | Request size and growth, evidence volume, provider limits | No identical retry for HTTP 400/413                  |
+| Invalid schema or unsupported parameter                   | Tool schema, provider/model support, configured effort    | No identical retry for HTTP 400                      |
+| Credentials, permissions, credit limit, unavailable model | Selected account, access, quota and model ID              | No retry for HTTP 401/402/403/404                    |
+| Rate limit, HTTP timeout or server failure                | Provider health and retry events                          | Existing bounded retry for 408/429/5xx               |
+| Transport failure                                         | Fixed DNS, connection, timeout or cancellation category   | SDK-marked retryable transport failures only         |
+| Response parse/schema failure                             | Parser category and safe validation paths                 | Existing bounded retry; validation is never bypassed |
+| Unknown request rejection                                 | Status, call and safe classification evidence             | Do not infer a cause from a generic HTTP 400         |
+
+HTTP errors retain a fixed `details.code`/`reason`, an allowlisted parameter when supplied,
+and whether classification came from an HTTP status, structured provider code or recognized
+message pattern. Error-body inspection is capped at 64 KiB. `bodyFormat` marks missing,
+oversized, non-JSON or unreadable bodies. Unrecognized details remain unknown; no arbitrary
+provider message, body, header, source excerpt or prompt is written to routine diagnostics.
+Nested OpenRouter upstream errors are inspected within the same bounds.
+
+`finalization_failed` records the failed save/report/seal stage and original stop reason.
+A secondary write failure does not replace the primary execution failure. Failure to persist
+required diagnostic evidence prevents a clean completion. No automatic retry is added for
+feedback or GitHub writes, which may already have taken effect.
+
 ## Data handling and feedback
 
 `--feedback send|off` defaults to **send**. After local finalization, `send` reports

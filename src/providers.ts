@@ -9,35 +9,15 @@ export type ProviderConfiguration = {
     effort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
 };
 
-function providerErrorMessage(body: unknown): string {
-    const object = body && typeof body === 'object' ? (body as Record<string, unknown>) : null;
-    const error = object?.error;
-    const message = error && typeof error === 'object' ? (error as Record<string, unknown>).message : null;
-    return typeof message === 'string' ? message.slice(0, 1000) : '';
-}
-
-/** Classify known HTTP failures without persisting provider messages or metadata. */
-export const PROVIDER_FAILURE_CODES = [
-    'provider_credit_limit',
-    'provider_credential_invalid',
-    'provider_rate_limited',
-    'provider_permission_denied',
-    'provider_schema_invalid',
-    'provider_unavailable',
-    'provider_request_failed',
-] as const;
-export type ProviderFailureCode = (typeof PROVIDER_FAILURE_CODES)[number];
-export function providerHttpFailure(status: number, body: unknown): ProviderFailureCode {
-    const knownMessage = providerErrorMessage(body);
-    if (status === 402 || (status === 403 && /\bkey spending limit exceeded\b/iu.test(knownMessage)))
-        return 'provider_credit_limit';
-    if (status === 401) return 'provider_credential_invalid';
-    if (status === 429) return 'provider_rate_limited';
-    if (status === 403) return 'provider_permission_denied';
-    if (status === 400 && /\binvalid (?:json )?schema\b/iu.test(knownMessage)) return 'provider_schema_invalid';
-    if (status >= 500 && status <= 599) return 'provider_unavailable';
-    return 'provider_request_failed';
-}
+export {
+    PROVIDER_FAILURE_CODES,
+    providerHttpFailure,
+    providerHttpDiagnostics,
+    providerRequestDiagnostics,
+    providerTransportDiagnostics,
+    providerResponseDiagnostics,
+} from './provider-diagnostics.js';
+export type { ProviderFailureCode } from './provider-diagnostics.js';
 
 const categories = new Set([
     'AI_APICallError',
@@ -151,6 +131,14 @@ export function providerFailureDiagnostics(error: unknown) {
     return { causes, validation, ...(parse ? { parse } : {}) };
 }
 
+/** A local record failed after a provider response; repeating the paid request cannot repair it. */
+export class ProviderAccountingError extends Error {
+    constructor(cause: unknown) {
+        super('provider_accounting_failed', { cause });
+        this.name = 'ProviderAccountingError';
+    }
+}
+
 /** Retry only failed provider operations, before any response tools execute. */
 export function recoverProviderCalls(
     model: Parameters<typeof wrapLanguageModel>[0]['model'],
@@ -169,10 +157,9 @@ export function recoverProviderCalls(
                 let retries = 0;
                 for (;;) {
                     signal.throwIfAborted();
+                    let response: Awaited<ReturnType<typeof doGenerate>>;
                     try {
-                        const response = await doGenerate();
-                        if (retries) await onRecovery('provider_recovered', retries);
-                        return response;
+                        response = await doGenerate();
                     } catch (error) {
                         if (signal.aborted || !recoverableProviderError(error)) throw error;
                         if (retries >= 2) {
@@ -182,7 +169,11 @@ export function recoverProviderCalls(
                         retries++;
                         await onRecovery('provider_retry', retries, error);
                         await delay(250 * 2 ** (retries - 1), undefined, { signal });
+                        continue;
                     }
+                    // Recovery telemetry is local work and must never repeat a successful request.
+                    if (retries) await onRecovery('provider_recovered', retries);
+                    return response;
                 }
             },
         },
@@ -190,6 +181,13 @@ export function recoverProviderCalls(
 }
 
 function recoverableProviderError(error: unknown): boolean {
+    const seen = new Set<unknown>();
+    let cause = error;
+    while (cause instanceof Error && !seen.has(cause)) {
+        if (cause instanceof ProviderAccountingError) return false;
+        seen.add(cause);
+        cause = cause.cause;
+    }
     // Our usage reader parses the same response before the SDK; malformed JSON can surface here directly.
     if (error instanceof SyntaxError) return true;
     if (!(error instanceof Error) || error.name !== 'AI_APICallError') return false;

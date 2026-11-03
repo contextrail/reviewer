@@ -13,10 +13,13 @@ import { CitationError, EvidenceLedger, modelEvidence, resolveCitationSelections
 import { DEFAULT_POLICY, decideExit, type ReviewEntry, type AcceptedResult, type ReviewPolicy } from './results.js';
 import {
     reviewModel,
+    ProviderAccountingError,
     recoverProviderCalls,
     reportedUsage,
     providerFailureDiagnostics,
-    providerHttpFailure,
+    providerResponseDiagnostics,
+    providerRequestDiagnostics,
+    providerTransportDiagnostics,
     type ProviderConfiguration,
     type ReviewProvider,
     type ProviderFailureCode,
@@ -28,6 +31,7 @@ import { ReviewBudget, BudgetStop, DEFAULT_EXECUTION_LIMITS, type ExecutionLimit
 import {
     Diagnostics,
     sanitizeRecord,
+    systemFailureDiagnostics,
     submissionDiagnostics,
     submissionToolDiagnostics,
     type LogLevel,
@@ -546,22 +550,36 @@ async function persistPartialAssessment<T>(session: PhaseRuntime<T>, progress: {
 async function invokeTool<T, ToolResult>(session: PhaseRuntime<T>, name: string, body: () => Promise<ToolResult>) {
     const { run, phase, workUnitId, attempt, signal } = session;
     const { diagnostics } = run;
+    const started = performance.now();
 
     await diagnostics.event('tool_started', { phase, workUnitId, attempt, tool: name });
     try {
         signal.throwIfAborted();
         const result = await body();
-        await diagnostics.event('tool_completed', { phase, workUnitId, attempt, tool: name });
+        await diagnostics.event('tool_completed', {
+            phase,
+            workUnitId,
+            attempt,
+            tool: name,
+            elapsedMs: performance.now() - started,
+        });
         return result;
     } catch (error) {
+        await diagnostics.event('tool_failed', {
+            phase,
+            workUnitId,
+            attempt,
+            tool: name,
+            code:
+                error instanceof SourceAccessError
+                    ? error.code
+                    : signal.aborted
+                      ? 'cancelled'
+                      : 'tool_execution_failed',
+            elapsedMs: performance.now() - started,
+            details: { ...providerFailureDiagnostics(error), ...systemFailureDiagnostics(error) },
+        });
         if (error instanceof SourceAccessError) {
-            await diagnostics.event('tool_failed', {
-                phase,
-                workUnitId,
-                attempt,
-                tool: name,
-                code: error.code,
-            });
             return {
                 error: error.code,
                 correction:
@@ -839,24 +857,27 @@ function createProviderFetch<T>(session: PhaseRuntime<T>): typeof fetch {
             missing: true,
         };
         state.execution.providerUsage.push(item);
-        await diagnostics.event('provider_started', {
-            phase,
-            workUnitId,
-            attempt,
-            call,
-            provider: models[phase].provider,
-            model: models[phase].model,
-        });
+        const started = Date.now();
+        const request = providerRequestDiagnostics(init?.body);
+        const context = { phase, workUnitId, attempt, call, request };
+        await diagnostics
+            .event('provider_started', {
+                ...context,
+                provider: models[phase].provider,
+                model: models[phase].model,
+            })
+            .catch((error: unknown) => {
+                throw new ProviderAccountingError(error);
+            });
+        let recorded = false;
         try {
             const response = await (options.fetch ?? fetch)(input, init);
             if (!response.ok) {
                 budget.record(null);
-                const errorBody: unknown = await response
-                    .clone()
-                    .json()
-                    .catch(() => null);
+                recorded = true;
+                const details = await providerResponseDiagnostics(response);
                 item.httpStatus = response.status;
-                item.failureCode = providerHttpFailure(response.status, errorBody);
+                item.failureCode = details.code;
                 await diagnostics.event('provider_failed', {
                     phase,
                     workUnitId,
@@ -864,7 +885,11 @@ function createProviderFetch<T>(session: PhaseRuntime<T>): typeof fetch {
                     call,
                     status: response.status,
                     code: item.failureCode,
+                    request,
+                    details,
+                    elapsedMs: Date.now() - started,
                 });
+                await persist();
                 return response;
             }
             const body = (await response.clone().json()) as Record<string, unknown>;
@@ -872,6 +897,7 @@ function createProviderFetch<T>(session: PhaseRuntime<T>): typeof fetch {
             item.missing = item.usage === null;
             const usage = reportedUsage(models[phase].provider, item.usage);
             budget.record(usage.totalTokens);
+            recorded = true;
             state.execution.usage.push({
                 call,
                 phase,
@@ -888,20 +914,31 @@ function createProviderFetch<T>(session: PhaseRuntime<T>): typeof fetch {
                 attempt,
                 call,
                 status: response.status,
+                request,
+                elapsedMs: Date.now() - started,
                 usage: Object.fromEntries(Object.entries(usage).filter(([key]) => key !== 'raw')),
             });
             await persist();
             return response;
         } catch (error) {
-            budget.record(null);
-            await diagnostics.event('provider_failed', {
-                phase,
-                workUnitId,
-                attempt,
-                call,
-                code: signal.aborted ? 'cancelled' : 'transport_or_response_invalid',
-            });
-            throw error;
+            if (!recorded) budget.record(null);
+            await diagnostics
+                .event(recorded ? 'provider_accounting_failed' : 'provider_failed', {
+                    ...context,
+                    elapsedMs: Date.now() - started,
+                    details: {
+                        ...providerFailureDiagnostics(error),
+                        ...providerTransportDiagnostics(error),
+                        ...systemFailureDiagnostics(error),
+                    },
+                    code: signal.aborted
+                        ? 'cancelled'
+                        : recorded
+                          ? 'provider_accounting_failed'
+                          : 'transport_or_response_invalid',
+                })
+                .catch(() => undefined);
+            throw recorded ? new ProviderAccountingError(error) : error;
         }
     };
 }
@@ -1004,6 +1041,18 @@ async function runPhaseModel<T>(session: PhaseRuntime<T>) {
     if (session.output === undefined)
         throw new BudgetStop(session.rejected >= 3 ? 'phase_corrections_exhausted' : 'model_stopped');
 }
+function knownExecutionFailure(error: unknown) {
+    const codes = [
+        'provider_credential_missing',
+        'provider_selection_invalid',
+        'provider_model_missing',
+        'provider_setting_unsupported',
+        'upstream_artifact_changed',
+        'upstream_phase_changed',
+        'pinned_material_changed',
+    ];
+    return error instanceof Error && codes.includes(error.message) ? error.message : 'provider_or_execution_failed';
+}
 function phaseStopReason<T>(session: PhaseRuntime<T>, failure: unknown) {
     if (!failure) return null;
     if (failure instanceof BudgetStop) return failure.code;
@@ -1011,19 +1060,7 @@ function phaseStopReason<T>(session: PhaseRuntime<T>, failure: unknown) {
         if (session.run.options.signal?.aborted) return 'cancelled';
         return session.phase === 'verify' ? 'max_time_ms' : 'verification_time_reserved';
     }
-    if (
-        failure instanceof Error &&
-        [
-            'provider_credential_missing',
-            'provider_selection_invalid',
-            'provider_model_missing',
-            'provider_setting_unsupported',
-            'upstream_artifact_changed',
-            'upstream_phase_changed',
-        ].includes(failure.message)
-    )
-        return failure.message;
-    return 'provider_or_execution_failed';
+    return knownExecutionFailure(failure);
 }
 async function persistPhaseResult<T>(session: PhaseRuntime<T>, failure: unknown): Promise<T> {
     const { run, phase, workUnitId, assigned, attempt, startedAt, inputRefs, phaseCalls, signal, instructions } =
@@ -1073,7 +1110,13 @@ async function persistPhaseResult<T>(session: PhaseRuntime<T>, failure: unknown)
         workUnitId,
         attempt,
     });
-    await diagnostics.event('phase_completed', { phase, workUnitId, attempt, outputHash: record.outputHash });
+    await diagnostics.event('phase_completed', {
+        phase,
+        workUnitId,
+        attempt,
+        outputHash: record.outputHash,
+        elapsedMs: Date.now() - Date.parse(startedAt),
+    });
     // Reconciliation works on a copy; persisted handoffs remain immutable.
     return structuredClone(session.output!);
 }
@@ -1095,6 +1138,7 @@ async function invokePhase<T>(
     } catch (error) {
         failure = session.signal.aborted ? new BudgetStop(phaseStopReason(session, error)!) : error;
         await run.diagnostics.event('phase_failed', {
+            elapsedMs: Date.now() - Date.parse(session.startedAt),
             phase,
             workUnitId,
             attempt,
@@ -1104,12 +1148,30 @@ async function invokePhase<T>(
                     : session.signal.aborted
                       ? 'phase_deadline_or_cancelled'
                       : 'provider_or_execution_failed',
-            details: providerFailureDiagnostics(error),
+            details: { ...providerFailureDiagnostics(error), ...systemFailureDiagnostics(error) },
         });
     } finally {
         if (session.timer !== null) clearTimeout(session.timer);
     }
-    return persistPhaseResult(session, failure);
+    try {
+        return await persistPhaseResult(session, failure);
+    } catch (error) {
+        // persistPhaseResult rethrows the model failure after saving its handoff.
+        // Only a different failure here means the handoff itself could not be persisted or validated.
+        if (error !== failure) {
+            await run.diagnostics
+                .event(failure ? 'phase_persistence_failed' : 'phase_failed', {
+                    phase,
+                    workUnitId,
+                    attempt,
+                    code: 'phase_artifact_failed',
+                    elapsedMs: Date.now() - Date.parse(session.startedAt),
+                    details: { ...providerFailureDiagnostics(error), ...systemFailureDiagnostics(error) },
+                })
+                .catch(() => undefined);
+        }
+        throw failure ?? error;
+    }
 }
 const requirementsFor = (run: ReviewRuntime) =>
     Object.fromEntries(
@@ -1335,13 +1397,11 @@ export async function runReview(options: ReviewOptions) {
                 ? error.code
                 : options.signal?.aborted
                   ? 'cancelled'
-                  : error instanceof Error && error.message === 'pinned_material_changed'
-                    ? 'pinned_material_changed'
-                    : 'provider_or_execution_failed';
+                  : knownExecutionFailure(error);
         await run.diagnostics
             .event('execution_stopped', {
                 code: run.state.execution.stopReason,
-                details: providerFailureDiagnostics(error),
+                details: { ...providerFailureDiagnostics(error), ...systemFailureDiagnostics(error) },
             })
             .catch(() => undefined);
     }
@@ -1403,34 +1463,62 @@ async function finalizeReview(run: ReviewRuntime, executionFailure: boolean) {
     );
     state.reviewStatus = state.decision.complete && !executionFailure ? 'complete' : 'incomplete';
     const reportPath = join(directory, 'report.json');
+    const started = performance.now();
+    const primaryStopReason = state.execution.stopReason;
+    let stage = 'diagnostics';
     try {
+        await diagnostics.event('review_finalization_started', {
+            status: state.reviewStatus,
+            exitCode: state.decision.exitCode,
+            elapsedMs: state.execution.elapsedMs,
+            complete: state.verification.complete,
+        });
+        stage = 'state_write';
+        await persist();
+        stage = 'json_report';
+        await atomicJson(reportPath, sanitizeRecord(state));
+        stage = 'markdown_report';
+        await writeFile(join(directory, 'report.md'), markdownReport(state), { mode: 0o600 });
+        stage = 'feedback';
+        state.execution.reporting = await deliverReviewFeedback(state, options);
+        await diagnostics.event('review_reporting', { reporting: state.execution.reporting.status });
+        stage = 'reporting_status';
+        await atomicJson(join(directory, 'reporting-status.json'), {
+            runId: state.runId,
+            reporting: state.execution.reporting,
+        });
+        stage = 'state_write';
+        await persist();
+        stage = 'json_report';
+        await atomicJson(reportPath, sanitizeRecord(state));
+        stage = 'markdown_report';
+        await writeFile(join(directory, 'report.md'), markdownReport(state), { mode: 0o600 });
+        stage = 'diagnostics';
         await diagnostics.event('review_finalized', {
             status: state.reviewStatus,
             exitCode: state.decision.exitCode,
             elapsedMs: state.execution.elapsedMs,
             complete: state.verification.complete,
         });
-        await persist();
-        await atomicJson(reportPath, sanitizeRecord(state));
-        await writeFile(join(directory, 'report.md'), markdownReport(state), { mode: 0o600 });
-        state.execution.reporting = await deliverReviewFeedback(state, options);
-        await diagnostics.event('review_reporting', { reporting: state.execution.reporting.status });
-        await atomicJson(join(directory, 'reporting-status.json'), {
-            runId: state.runId,
-            reporting: state.execution.reporting,
-        });
-        await persist();
-        await atomicJson(reportPath, sanitizeRecord(state));
-        await writeFile(join(directory, 'report.md'), markdownReport(state), { mode: 0o600 });
         await diagnostics.flush();
+        stage = 'artifact_seal';
         await sealReportArtifacts(directory, state);
-    } catch {
+    } catch (error) {
         state.decision = { ...state.decision, exitCode: 2 };
         state.reviewStatus = 'incomplete';
-        state.execution.stopReason = 'report_delivery_failed';
-        await diagnostics.event('finalization_failed', { code: 'report_delivery_failed' }).catch(() => undefined);
-        state.execution.reporting =
-            options.feedback === 'off' ? { status: 'off' } : { status: 'failed', code: 'finalization_unavailable' };
+        state.execution.stopReason = executionFailure ? primaryStopReason : 'report_delivery_failed';
+        await diagnostics
+            .event('finalization_failed', {
+                code: 'report_delivery_failed',
+                primaryStopReason,
+                stage,
+                elapsedMs: performance.now() - started,
+                details: { ...providerFailureDiagnostics(error), ...systemFailureDiagnostics(error) },
+            })
+            .catch(() => undefined);
+        if (state.execution.reporting.status === 'pending')
+            state.execution.reporting =
+                options.feedback === 'off' ? { status: 'off' } : { status: 'failed', code: 'finalization_unavailable' };
         await atomicJson(prepared.statePath, sanitizeRecord(state)).catch(() => undefined);
         await atomicJson(reportPath, sanitizeRecord(state)).catch(() => undefined);
     }

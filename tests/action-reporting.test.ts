@@ -298,6 +298,138 @@ describe('Action health summary', () => {
         expect(f.markdown()).toContain('expected array, actual string');
         expect(f.markdown()).toContain('HTTP 200; call 2');
     });
+    it('correlates a terminal provider rejection with its phase and request metadata', () => {
+        const f = fixture();
+        f.state.execution.stopReason = 'provider_or_execution_failed';
+        f.save();
+        const phase = { phase: 'verify', workUnitId: 'all', attempt: 1 };
+        const events = [
+            { kind: 'phase_started', data: phase },
+            { kind: 'provider_started', data: { ...phase, call: 8 } },
+            {
+                kind: 'provider_failed',
+                data: {
+                    ...phase,
+                    call: 8,
+                    status: 400,
+                    code: 'provider_request_failed',
+                    request: { requestBytes: 125000 },
+                    elapsedMs: 1800,
+                    details: {
+                        code: 'provider_context_limit',
+                        reason: 'context_length_exceeded',
+                        parameter: 'messages',
+                        transport: 'connection_reset',
+                        message: 'private upstream body',
+                    },
+                },
+            },
+            { kind: 'phase_failed', data: { ...phase, code: 'provider_or_execution_failed' } },
+            { kind: 'execution_stopped', data: { code: 'provider_or_execution_failed' } },
+        ];
+        writeFileSync(
+            join(f.root, 'comparison/.contextrail/reviewer/fixture/diagnostics.jsonl'),
+            events.map((event) => JSON.stringify(event)).join('\n'),
+        );
+        expect(f.run('summary').status).toBe(0);
+        expect(f.markdown().replaceAll('\\', '')).toContain('Failure: provider_request_failed; HTTP 400; call 8');
+        expect(f.markdown()).toContain('Phase verify');
+        expect(f.markdown()).toContain('Parameter messages');
+        expect(f.markdown().replaceAll('\\', '')).toContain('Transport connection_reset');
+        expect(f.markdown().replaceAll('\\', '')).toContain('context_length_exceeded');
+        expect(f.markdown()).toContain('Request 125000 bytes');
+        expect(f.markdown()).toContain('Request duration 1800 ms');
+        expect(f.markdown()).not.toContain('private upstream body');
+    });
+    it.each([
+        'provider_completed',
+        'provider_recovered',
+        'provider_started',
+        'provider_accounting_failed',
+        'new_phase',
+        'different_failure',
+    ])('does not blame an earlier provider failure after %s', (next) => {
+        const f = fixture();
+        f.state.execution.stopReason = 'provider_or_execution_failed';
+        f.save();
+        const phase = { phase: 'assess', workUnitId: 'all', attempt: 1 };
+        const events = [
+            { kind: 'phase_started', data: phase },
+            { kind: 'provider_failed', data: { ...phase, call: 1, status: 503, code: 'provider_unavailable' } },
+            ...(next === 'different_failure'
+                ? []
+                : [
+                      {
+                          kind: next === 'new_phase' ? 'phase_started' : next,
+                          data: { ...phase, phase: next === 'new_phase' ? 'verify' : 'assess', call: 2 },
+                      },
+                  ]),
+            {
+                kind: 'phase_failed',
+                data: {
+                    ...phase,
+                    phase: next === 'new_phase' ? 'verify' : 'assess',
+                    code: next === 'different_failure' ? 'phase_corrections_exhausted' : 'provider_or_execution_failed',
+                },
+            },
+            { kind: 'execution_stopped', data: { code: 'provider_or_execution_failed' } },
+        ];
+        writeFileSync(
+            join(f.root, 'comparison/.contextrail/reviewer/fixture/diagnostics.jsonl'),
+            events.map((event) => JSON.stringify(event)).join('\n'),
+        );
+        expect(f.run('summary').status).toBe(0);
+        expect(f.markdown()).not.toContain('HTTP 503');
+        expect(f.markdown().replaceAll('\\', '')).not.toContain('provider_unavailable');
+    });
+    it.each([true, false])('shows finalization failure without erasing a primary failure (%s)', (primary) => {
+        const f = fixture();
+        f.state.execution.stopReason = primary ? 'cancelled' : 'report_delivery_failed';
+        f.save();
+        const events = [
+            ...(primary ? [{ kind: 'execution_stopped', data: { code: 'cancelled' } }] : []),
+            {
+                kind: 'finalization_failed',
+                data: {
+                    code: 'report_delivery_failed',
+                    stage: 'artifact_seal',
+                    details: { message: 'private exception' },
+                },
+            },
+        ];
+        writeFileSync(
+            join(f.root, 'comparison/.contextrail/reviewer/fixture/diagnostics.jsonl'),
+            events.map((event) => JSON.stringify(event)).join('\n'),
+        );
+        expect(f.run('summary').status).toBe(0);
+        const markdown = f.markdown().replaceAll('\\', '');
+        expect(markdown).toContain('Finalization failed: report_delivery_failed; stage artifact_seal');
+        if (primary) expect(markdown).toContain('Failure: cancelled');
+        expect(markdown).not.toContain('private exception');
+    });
+    it('retains successful HTTP identity for a terminal SDK parse error and marks truncated evidence', () => {
+        const f = fixture();
+        f.state.execution.stopReason = 'provider_or_execution_failed';
+        f.save();
+        const phase = { phase: 'verify', workUnitId: 'all', attempt: 1 };
+        const events = [
+            { kind: 'phase_started', data: phase },
+            { kind: 'provider_completed', data: { ...phase, call: 8, status: 200, request: { requestBytes: 1000 } } },
+            { kind: 'phase_failed', data: { ...phase, code: 'provider_or_execution_failed' } },
+            {
+                kind: 'execution_stopped',
+                data: { code: 'provider_or_execution_failed', details: { causes: ['AI_JSONParseError'] } },
+            },
+        ];
+        writeFileSync(
+            join(f.root, 'comparison/.contextrail/reviewer/fixture/diagnostics.jsonl'),
+            events.map((event) => JSON.stringify(event)).join('\n') + '\n{"kind":',
+        );
+        expect(f.run('summary').status).toBe(0);
+        expect(f.markdown()).toContain('HTTP 200; call 8');
+        expect(f.markdown()).toContain('Request 1000 bytes');
+        expect(f.markdown()).toContain('Diagnostic evidence incomplete');
+    });
     it('does not attribute a different comparison or reviewer to the current run', () => {
         const f = fixture();
         f.state.artifact.head.commit = 'c'.repeat(40);

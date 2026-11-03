@@ -15,8 +15,8 @@ const comparison = [
 ];
 const unresolvedGit = 'Cannot resolve repository and base/head references to Git commits.';
 
-function run(args: string[], env: Record<string, string> = {}) {
-    return spawnSync(process.execPath, [cli, ...args], {
+function run(args: string[], env: Record<string, string> = {}, nodeArgs: string[] = []) {
+    return spawnSync(process.execPath, [...nodeArgs, cli, ...args], {
         encoding: 'utf8',
         timeout: 10_000,
         // Deliberately omit local credentials/configuration: these are offline CLI boundary tests.
@@ -80,6 +80,46 @@ describe('CLI configuration boundaries', () => {
         expect(run(['prepare', ...comparison, '--resume', 'saved-run']).stderr.trim()).toBe(
             '--resume is only valid for review.',
         );
+    });
+
+    it.each([
+        ['EACCES', 'filesystem_permission_denied'],
+        ['ENOSPC', 'filesystem_storage_full'],
+        ['ENOENT', 'filesystem_path_missing'],
+        ['ECONNRESET', 'transport_failed'],
+        ['UNRECOGNIZED_PRIVATE_CODE', 'command_failed'],
+    ])('reports bounded %s preparation failures without leaking exception contents', (code, expected) => {
+        const preload = `import fs from 'node:fs/promises';
+import { syncBuiltinESMExports } from 'node:module';
+fs.mkdir = async () => { throw Object.assign(new Error('private source and secret-token'), { code: ${JSON.stringify(code)}, path: '/private/customer/file' }); };
+syncBuiltinESMExports();`;
+        const result = run(
+            [
+                'prepare',
+                '--reviewer',
+                'skill://test/reviewer',
+                '--repo',
+                fileURLToPath(new URL('../../../', import.meta.url)),
+                '--base',
+                'HEAD',
+                '--head',
+                'HEAD',
+            ],
+            {
+                CONTEXTRAIL_MCP_URL: 'https://example.invalid/mcp',
+                CONTEXTRAIL_MCP_AUTH_TOKEN: 'fixture-token',
+                CONTEXTRAIL_MCP_ORG_ID: 'fixture',
+            },
+            ['--import', `data:text/javascript,${encodeURIComponent(preload)}`],
+        );
+        expect(result.status).toBe(2);
+        expect(result.stdout).toBe('');
+        const failure = JSON.parse(result.stderr.trim());
+        expect(failure).toMatchObject({ kind: 'cli_failed', data: { stage: 'preparation', code: expected } });
+        if (code === 'ECONNRESET') expect(failure.data.transport).toBe('connection_reset');
+        expect(result.stderr).not.toContain('private');
+        expect(result.stderr).not.toContain('secret-token');
+        expect(result.stderr).not.toContain('UNRECOGNIZED_PRIVATE_CODE');
     });
 
     it('routes GitHub commands without falling through to review execution', () => {

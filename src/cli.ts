@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { loadPrContext } from './pr-context.js';
 import { packageVersion } from './version.js';
+import { systemFailureDiagnostics } from './diagnostics.js';
 import { parseArgs } from 'node:util';
 import { fixGitIdentity } from './git.js';
 import { McpPublishedReader, mcpTimeoutMs } from './mcp.js';
@@ -8,7 +9,7 @@ import { prepareReview } from './prepare.js';
 import { loadReviewCheckpoint } from './resume.js';
 import { runReview, DEFAULT_EXECUTION_LIMITS, type ExecutionLimits } from './review.js';
 import { DEFAULT_SOURCE_LIMITS, type SourceLimits } from './source.js';
-import type { ProviderConfiguration } from './providers.js';
+import { providerTransportDiagnostics, type ProviderConfiguration } from './providers.js';
 import type { ReviewPolicy } from './results.js';
 import { prepareGitHubReview, publishGitHubReview } from './github.js';
 
@@ -329,7 +330,9 @@ function commandComparison(values: CliValues, isReview: boolean, setting: Settin
     }
     return { artifact, prContext };
 }
+let commandStage = 'arguments';
 async function runCommand(values: CliValues, isReview: boolean) {
+    commandStage = 'configuration';
     const {
         setting,
         resumePath,
@@ -346,11 +349,13 @@ async function runCommand(values: CliValues, isReview: boolean) {
     const timeoutMs = mcpTimeoutMs(
         (values['mcp-timeout-ms'] as string | undefined) ?? process.env.CONTEXTRAIL_MCP_TIMEOUT_MS,
     );
+    commandStage = 'comparison';
     const { artifact, prContext } = commandComparison(values, isReview, setting);
     const controller = new AbortController();
     const cancel = () => controller.abort();
     process.on('SIGINT', cancel);
     process.on('SIGTERM', cancel);
+    commandStage = 'mcp_configuration';
     const reader = new McpPublishedReader(
         process.env.CONTEXTRAIL_MCP_URL ?? '',
         process.env.CONTEXTRAIL_MCP_AUTH_TOKEN ?? '',
@@ -359,12 +364,14 @@ async function runCommand(values: CliValues, isReview: boolean) {
         { timeoutMs, signal: controller.signal, repositoryAttribution },
     );
     try {
+        commandStage = resumePath ? 'resume' : 'preparation';
         const resumed = resumePath
             ? loadReviewCheckpoint(resumePath, {
                   artifact,
                   reviewerId: values.reviewer as string,
               })
             : null;
+        commandStage = 'preparation';
         const prepared =
             resumed?.prepared ??
             (await prepareReview({
@@ -376,6 +383,7 @@ async function runCommand(values: CliValues, isReview: boolean) {
                 artifact,
             }));
         if (isReview) {
+            commandStage = 'review';
             const result = await runReview({
                 prepared,
                 resume: resumed?.checkpoint,
@@ -419,7 +427,10 @@ async function main() {
         process.stdout.write(`${packageVersion}\n`);
         return;
     }
-    if (positionals[0] === 'github') return runGitHubCommand(values, positionals);
+    if (positionals[0] === 'github') {
+        commandStage = 'github';
+        return runGitHubCommand(values, positionals);
+    }
     if (
         positionals.length !== 1 ||
         !['prepare', 'review'].includes(positionals[0]!) ||
@@ -431,11 +442,18 @@ async function main() {
     await runCommand(values, positionals[0] === 'review');
 }
 
+function commandFailure(error: unknown) {
+    const { systemCode } = systemFailureDiagnostics(error);
+    if (systemCode) return { code: systemCode };
+    const transport = providerTransportDiagnostics(error);
+    if (transport.transport !== 'unknown') return { code: 'transport_failed', ...transport };
+    return { code: commandStage === 'mcp_configuration' ? 'invalid_mcp_configuration' : 'command_failed' };
+}
 main().catch((error: unknown) => {
     process.stderr.write(
         error instanceof CliInputError
             ? `${error.message}\n`
-            : 'Invalid configuration or unavailable local review output. See --help; inspect any saved run state.\n',
+            : `${JSON.stringify({ kind: 'cli_failed', data: { stage: commandStage, ...commandFailure(error) } })}\n`,
     );
     process.exitCode = 2;
 });

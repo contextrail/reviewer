@@ -3,7 +3,7 @@ import { CitationError, EvidenceLedger } from '../src/evidence.js';
 import { digest } from '../src/prepare.js';
 import { createOpenAI } from '@ai-sdk/openai';
 import { z } from 'zod';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -52,7 +52,7 @@ describe('safe diagnostics independent of console level', () => {
             expect(text).toContain('provider_completed');
             expect(text).toContain('unit1');
             expect(text).not.toMatch(/RAW_PROMPT|SOURCE_QUOTE|RAW_RESPONSE|SENSITIVE_KEY_12345/);
-            expect(log.mock.calls.length).toBe(level === 'quiet' ? 0 : level === 'info' ? 1 : 2);
+            expect(log.mock.calls.length).toBe(level === 'quiet' ? 0 : 2);
         },
     );
 });
@@ -374,4 +374,29 @@ describe('content-free typed citation diagnostics', () => {
         expect(text).not.toMatch(/PRIVATE|<script>/);
         expect(log).toHaveBeenCalledTimes(2);
     });
+});
+
+it('does not report a successful flush after an earlier diagnostic write failed', async () => {
+    const parent = mkdtempSync(join(tmpdir(), 'diagnostic-write-'));
+    dirs.push(parent);
+    const directory = join(parent, 'missing');
+    const diagnostics = new Diagnostics(directory, 'run-id', 'quiet', () => {});
+    await expect(diagnostics.event('phase_started')).rejects.toThrow();
+    mkdirSync(directory);
+    await diagnostics.event('phase_completed');
+    await expect(diagnostics.flush()).rejects.toThrow('diagnostic_write_failed');
+    expect(readFileSync(join(directory, 'diagnostics.jsonl'), 'utf8')).toContain('phase_completed');
+});
+
+it('contains a failing console sink and preserves diagnostic artifacts', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'diagnostic-sink-'));
+    dirs.push(directory);
+    const diagnostics = new Diagnostics(directory, 'run-id', 'debug', () => {
+        throw new SyntaxError('PRIVATE_SINK');
+    });
+    await diagnostics.event('provider_completed', { call: 1, status: 200 });
+    await expect(diagnostics.flush()).rejects.toThrow('diagnostic_write_failed');
+    const text = readFileSync(join(directory, 'diagnostics.jsonl'), 'utf8');
+    expect(text).toContain('provider_completed');
+    expect(text).not.toContain('PRIVATE_SINK');
 });

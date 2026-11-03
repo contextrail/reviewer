@@ -1032,9 +1032,10 @@ describe('governed phase execution through actual SDK provider wires', () => {
         expect(result.state.phases.filter((p) => p.phase === 'verify')).toHaveLength(1);
     });
     it.each([
-        ['Key spending limit exceeded', 'provider_credit_limit'],
-        ['Request forbidden', 'provider_permission_denied'],
-    ])('retains a safe HTTP-403 category for %s without provider payload', async (message, code) => {
+        ['Key spending limit exceeded', 'provider_credit_limit', 403],
+        ['Request forbidden', 'provider_permission_denied', 403],
+        ['Maximum context length exceeded', 'provider_context_limit', 400],
+    ])('retains a safe HTTP category for %s without provider payload', async (message, code, status) => {
         vi.stubEnv('OPENROUTER_API_KEY', 'PRIVATE_PROVIDER_CREDENTIAL');
         const prepared = await preparedFixture();
         const result = await runReview({
@@ -1048,7 +1049,7 @@ describe('governed phase execution through actual SDK provider wires', () => {
                             metadata: { secret: 'PRIVATE_PROVIDER_CREDENTIAL', source: 'PRIVATE_REPOSITORY_SOURCE' },
                         },
                     }),
-                    { status: 403, headers: { 'content-type': 'application/json' } },
+                    { status, headers: { 'content-type': 'application/json' } },
                 ),
         });
         const diagnostics = readFileSync(join(result.directory, 'diagnostics.jsonl'), 'utf8');
@@ -1057,7 +1058,15 @@ describe('governed phase execution through actual SDK provider wires', () => {
             .split('\n')
             .map((line) => JSON.parse(line))
             .find((e) => e.kind === 'provider_failed');
-        expect(event.data).toMatchObject({ status: 403, code });
+        expect(event.data).toMatchObject({ status, code });
+        expect(event.data.elapsedMs).toBeGreaterThanOrEqual(0);
+        expect(event.data.request).toMatchObject({ requestFormat: 'json' });
+        expect(event.data.request.requestBytes).toBeGreaterThan(0);
+        expect(event.data.request.messageCount).toBeGreaterThan(0);
+        expect(event.data.request.toolCount).toBeGreaterThan(0);
+        expect(event.data.request.toolSchemaBytes).toBeGreaterThan(0);
+        expect(event.data.details.code).toBe(code);
+        expect(result.state.execution.calls).toBe(1);
         expect(diagnostics).not.toMatch(
             /PRIVATE_PROVIDER_CREDENTIAL|PRIVATE_REPOSITORY_SOURCE|PRIVATE_VENDOR_CODE|Key spending limit exceeded|Request forbidden/,
         );
@@ -1065,11 +1074,11 @@ describe('governed phase execution through actual SDK provider wires', () => {
             provider: 'openrouter',
             missing: true,
             usage: null,
-            httpStatus: 403,
+            httpStatus: status,
             failureCode: code,
         });
         const summary = renderActionSummary(result.state);
-        expect(summary).toContain(`Provider failures: 403 ${code} (1 call)`);
+        expect(summary).toContain(`Provider failures: ${status} ${code} (1 call)`);
         expect(summary).not.toMatch(
             /PRIVATE_PROVIDER_CREDENTIAL|PRIVATE_REPOSITORY_SOURCE|PRIVATE_VENDOR_CODE|Key spending limit exceeded|Request forbidden/,
         );
@@ -1084,7 +1093,7 @@ describe('governed phase execution through actual SDK provider wires', () => {
                 ],
             },
         });
-        expect(grouped).toContain(`Provider failures: 403 ${code} (3 calls)`);
+        expect(grouped).toContain(`Provider failures: ${status} ${code} (3 calls)`);
         expect(grouped).not.toContain('PRIVATE_UNTRUSTED_CODE');
         expect(result.state.decision?.exitCode).toBe(2);
     });
@@ -1121,6 +1130,24 @@ describe('governed phase execution through actual SDK provider wires', () => {
         });
         expect(result.state.execution.stopReason).toBe('total_token_limit_unmeasurable');
         expect(result.state.execution.usage[0]).toMatchObject({ totalTokens: null, cost: null });
+    });
+    it('reports missing provider credentials before any model request', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', '');
+        const prepared = await preparedFixture();
+        const fetch = vi.fn();
+        const result = await runReview({ ...fixtureOptions(prepared), fetch });
+        expect(fetch).not.toHaveBeenCalled();
+        expect(result.state.execution.calls).toBe(0);
+        expect(result.state.execution.stopReason).toBe('provider_credential_missing');
+        expect(result.state.decision?.exitCode).toBe(2);
+        const events = readFileSync(join(result.directory, 'diagnostics.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line));
+        expect(events.find((event) => event.kind === 'execution_stopped')?.data.code).toBe(
+            'provider_credential_missing',
+        );
+        expect(events.some((event) => event.kind === 'provider_started')).toBe(false);
     });
     it('rejects unsupported model/phase options before a provider request', async () => {
         const prepared = await preparedFixture(),
@@ -1163,6 +1190,47 @@ describe('governed phase execution through actual SDK provider wires', () => {
         const result = await runReview({ ...fixtureOptions(prepared), fetch: fixtureWire(prepared) });
         expect(result.state.decision).toMatchObject({ exitCode: 2, reviewExit: 1 });
         expect(result.state.execution.stopReason).toBe('report_delivery_failed');
+    });
+    it('records a phase artifact failure without claiming the phase completed', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        const prepared = await preparedFixture();
+        mkdirSync(join(dirname(prepared.statePath), 'phases', 'assess-all-1.json'), { recursive: true });
+        const result = await runReview({ ...fixtureOptions(prepared), fetch: fixtureWire(prepared) });
+        const events = readFileSync(join(result.directory, 'diagnostics.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line));
+        expect(events.find((event) => event.kind === 'phase_failed')?.data).toMatchObject({
+            phase: 'assess',
+            code: 'phase_artifact_failed',
+            elapsedMs: expect.any(Number),
+        });
+        expect(events.some((event) => event.kind === 'phase_completed')).toBe(false);
+        expect(result.state.decision?.exitCode).toBe(2);
+    });
+    it('retains the execution failure when report finalization also fails', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        const prepared = await preparedFixture();
+        mkdirSync(join(dirname(prepared.statePath), 'report.md'));
+        const result = await runReview({
+            ...fixtureOptions(prepared),
+            fetch: async () => new Response('PRIVATE_PROVIDER_FAILURE', { status: 401 }),
+        });
+        expect(result.state.execution.stopReason).toBe('provider_or_execution_failed');
+        expect(result.state.decision?.exitCode).toBe(2);
+        const events = readFileSync(join(result.directory, 'diagnostics.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line));
+        const failure = events.find((event) => event.kind === 'finalization_failed');
+        expect(failure.data).toMatchObject({
+            code: 'report_delivery_failed',
+            stage: 'markdown_report',
+            primaryStopReason: 'provider_or_execution_failed',
+            elapsedMs: expect.any(Number),
+        });
+        expect(events.some((event) => event.kind === 'review_finalized')).toBe(false);
+        expect(JSON.stringify(events)).not.toContain('PRIVATE_PROVIDER_FAILURE');
     });
     it('rejects tampered pinned material before model execution', async () => {
         const prepared = await preparedFixture(),
@@ -1416,6 +1484,41 @@ describe('source tool boundaries and verified suggestions', () => {
         });
         expect(result.state.verification.complete).toBe(true);
         expect(readFileSync(join(result.directory, 'diagnostics.jsonl'), 'utf8')).toContain('invalid_cursor');
+    });
+    it('records terminal timing for unexpected tool errors without logging their messages', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        const prepared = await preparedFixture();
+        const read = vi
+            .spyOn(FixedSnapshotSource.prototype, 'read')
+            .mockRejectedValueOnce(new Error('PRIVATE_TOOL_ERROR'));
+        try {
+            const result = await runReview({ ...fixtureOptions(prepared), fetch: fixtureWire(prepared) });
+            const log = readFileSync(join(result.directory, 'diagnostics.jsonl'), 'utf8');
+            const events = log
+                .trim()
+                .split('\n')
+                .map((line) => JSON.parse(line));
+            expect(events.find((event) => event.kind === 'tool_failed')?.data).toMatchObject({
+                tool: 'read_source',
+                code: 'tool_execution_failed',
+                elapsedMs: expect.any(Number),
+            });
+            const started = events.filter((event) => event.kind === 'tool_started');
+            const terminal = events.filter((event) => ['tool_completed', 'tool_failed'].includes(event.kind));
+            expect(terminal).toHaveLength(started.length);
+            expect(terminal.every((event) => Number.isFinite(event.data.elapsedMs) && event.data.elapsedMs >= 0)).toBe(
+                true,
+            );
+            const phases = events.filter((event) => ['phase_completed', 'phase_failed'].includes(event.kind));
+            expect(phases).toHaveLength(2);
+            expect(phases.every((event) => Number.isFinite(event.data.elapsedMs) && event.data.elapsedMs >= 0)).toBe(
+                true,
+            );
+            expect(result.state.verification.complete).toBe(true);
+            expect(log).not.toContain('PRIVATE_TOOL_ERROR');
+        } finally {
+            read.mockRestore();
+        }
     });
     it('does not expose credential files through read_source', async () => {
         vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
