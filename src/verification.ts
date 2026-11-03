@@ -56,11 +56,8 @@ export const verificationSelectionSchema = verificationSchema.extend({
     entries: z.array(
         verificationSchema.shape.entries.element.extend({
             citations: z.array(selectionSchema),
-            amendment: reviewSelectionSchema.shape.assessments.element.nullable().optional(),
-            resolution: resultSchema
-                .extend({ citations: z.array(selectionSchema) })
-                .nullable()
-                .optional(),
+            amendment: reviewSelectionSchema.shape.assessments.element.nullable(),
+            resolution: resultSchema.extend({ citations: z.array(selectionSchema) }).nullable(),
         }),
     ),
 });

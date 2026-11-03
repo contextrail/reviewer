@@ -126,6 +126,8 @@ try {
                                 reason: 'SENTINEL_LOCAL_VERIFICATION_C5',
                                 citations: [cite(source), cite(contextFor(entry))],
                                 missingChecks: [],
+                                resolution: null,
+                                amendment: null,
                                 findings: [],
                             })),
                         },

@@ -23,6 +23,16 @@ import { renderActionSummary, assessmentCoverage } from '../src/presentation.js'
 import type { Publication, PublishedReader } from '../src/contracts.js';
 import { providerFailureDiagnostics, type ReviewProvider } from '../src/providers.js';
 
+function assertStrictObjects(value: unknown): void {
+    if (!value || typeof value !== 'object') return;
+    const schema = value as Record<string, unknown>;
+    if (schema.type === 'object') {
+        expect(schema.additionalProperties).toBe(false);
+        expect([...((schema.required as string[]) ?? [])].sort()).toEqual(Object.keys(schema.properties ?? {}).sort());
+    }
+    for (const child of Object.values(schema)) assertStrictObjects(child);
+}
+
 const directories: string[] = [];
 afterEach(() => {
     vi.unstubAllEnvs();
@@ -405,6 +415,8 @@ function verificationInput(prepared: FixturePrepared, unit = 'all', attempt = 1,
                     };
                 }),
                 missingChecks: [],
+                resolution: null,
+                amendment: null,
                 findings: p.findings.map((f) => ({
                     findingId: f.findingId,
                     accepted: true,
@@ -931,6 +943,12 @@ describe('governed phase execution through actual SDK provider wires', () => {
                         .update(readFileSync(join(result.directory, name)))
                         .digest('hex')}`,
                 );
+            for (const request of requests) {
+                for (const wireTool of (request as { tools: Array<Record<string, unknown>> }).tools) {
+                    const definition = (wireTool.function ?? wireTool) as Record<string, unknown>;
+                    if (definition.strict === true) assertStrictObjects(definition.parameters);
+                }
+            }
             if (provider === 'openai') {
                 expect(urls.every((url) => url === 'https://api.openai.com/v1/responses')).toBe(true);
                 expect(requests[0]).toMatchObject({ store: false, reasoning: { effort: 'medium' } });

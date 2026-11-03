@@ -986,6 +986,8 @@ describe('real governed run publication boundary', () => {
                             reason: 'The original rule and pinned source agree.',
                             citations: [governingCitation, cite(source!)],
                             missingChecks: [],
+                            resolution: null,
+                            amendment: null,
                             findings: [],
                         },
                     ],
