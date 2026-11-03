@@ -49,35 +49,43 @@ try {
         prepared,
         provider: { provider: 'openrouter', model: 'fixture-model' },
         purpose: 'SENTINEL_LOCAL_PURPOSE_C5',
+        logLevel: 'quiet',
         feedback: values.feedback,
         feedbackSender: reader,
         repositoryAttribution: values['repository-attribution'],
         fetch: async () => {
             const call = ++calls;
+            const records = Object.values(
+                JSON.parse(
+                    await readFile(
+                        join(repository, '.contextrail', 'reviewer', prepared.state.runId, 'evidence.json'),
+                        'utf8',
+                    ),
+                ),
+            );
+            const source = records.find((r) => r.provenance.kind === 'source');
+            const interpretation = 'Apply this pinned criterion to the changed source.';
+            const contextFor = (entry) =>
+                records.find(
+                    (r) =>
+                        r.provenance.kind === 'publication' &&
+                        r.provenance.nodeId === entry.nodeId &&
+                        r.provenance.path === '/content/body',
+                );
+            const cite = (record) => ({
+                ref: record.ref,
+                startSegment: 1,
+                endSegment: (record.text.match(/[^\n]*\n|[^\n]+/g) ?? []).length,
+            });
             let tools;
             if (call === 1) tools = [{ name: 'read_source', input: { side: 'head', path: 'source.ts' } }];
-            else if (call === 2) {
-                const records = Object.values(
-                    JSON.parse(
-                        await readFile(
-                            join(repository, '.contextrail', 'reviewer', prepared.state.runId, 'evidence.json'),
-                            'utf8',
-                        ),
-                    ),
-                );
-                const source = records.find((r) => r.provenance.kind === 'source');
-                tools = [
-                    {
-                        name: 'submit_results',
-                        input: {
-                            results: prepared.state.entries.map((entry) => {
-                                const context = records.find(
-                                    (r) =>
-                                        r.provenance.kind === 'publication' &&
-                                        r.provenance.nodeId === entry.nodeId &&
-                                        r.provenance.path === '/content/body',
-                                );
-                                return {
+            else if (call === 2)
+                tools = prepared.state.entries.map((entry) => ({
+                    name: 'submit_assessments',
+                    input: {
+                        assessments: [
+                            {
+                                result: {
                                     assessmentId: entry.assessmentId,
                                     revisionOf: null,
                                     disposition: 'evaluated',
@@ -89,46 +97,41 @@ try {
                                     consequence: '',
                                     correction: '',
                                     limitations: ['SENTINEL_LOCAL_LIMITATION_C5'],
-                                    citations: [source, context].map((r) => ({ ref: r.ref, quote: r.text })),
-                                };
-                            }),
+                                    citations: [cite(source), cite(contextFor(entry))],
+                                },
+                                checks: [
+                                    {
+                                        passage: cite(contextFor(entry)),
+                                        interpretation,
+                                        disposition: 'evaluated',
+                                        explanation: 'SENTINEL_LOCAL_CHECK_C5',
+                                        sourceRefs: [cite(source)],
+                                        contraryEvidence: '',
+                                        missingEvidence: '',
+                                    },
+                                ],
+                                findings: [],
+                            },
+                        ],
+                    },
+                }));
+            else
+                tools = [
+                    {
+                        name: 'submit_verification',
+                        input: {
+                            entries: prepared.state.entries.map((entry) => ({
+                                assessmentId: entry.assessmentId,
+                                disposition: 'accept',
+                                reason: 'SENTINEL_LOCAL_VERIFICATION_C5',
+                                citations: [cite(source), cite(contextFor(entry))],
+                                missingChecks: [],
+                                findings: [],
+                            })),
                         },
                     },
                 ];
-            } else tools = [{ name: 'finish_review', input: { scope: 'SENTINEL_LOCAL_SCOPE_C5' } }];
-            return new Response(
-                JSON.stringify({
-                    id: `fixture-${call}`,
-                    object: 'chat.completion',
-                    created: 1,
-                    model: 'fixture-model',
-                    choices: [
-                        {
-                            index: 0,
-                            message: {
-                                role: 'assistant',
-                                content: null,
-                                tool_calls: tools.map((t, i) => ({
-                                    id: `call-${call}-${i}`,
-                                    type: 'function',
-                                    function: { name: t.name, arguments: JSON.stringify(t.input) },
-                                })),
-                            },
-                            finish_reason: 'tool_calls',
-                        },
-                    ],
-                    ...(call === 2
-                        ? {}
-                        : {
-                              usage: {
-                                  prompt_tokens: call === 1 ? 0 : 12,
-                                  completion_tokens: call === 1 ? 0 : 7,
-                                  total_tokens: call === 1 ? 0 : 19,
-                              },
-                          }),
-                }),
-                { headers: { 'content-type': 'application/json' } },
-            );
+            return fixtureResponse(tools, call);
         },
     });
     assert.equal(result.state.decision.exitCode, 0);
@@ -159,4 +162,40 @@ try {
 } finally {
     await reader.close();
     await rm(repository, { recursive: true, force: true });
+}
+
+function fixtureResponse(tools, call) {
+    return new Response(
+        JSON.stringify({
+            id: `fixture-${call}`,
+            object: 'chat.completion',
+            created: 1,
+            model: 'fixture-model',
+            choices: [
+                {
+                    index: 0,
+                    message: {
+                        role: 'assistant',
+                        content: null,
+                        tool_calls: tools.map((t, i) => ({
+                            id: `call-${call}-${i}`,
+                            type: 'function',
+                            function: { name: t.name, arguments: JSON.stringify(t.input) },
+                        })),
+                    },
+                    finish_reason: 'tool_calls',
+                },
+            ],
+            ...(call === 2
+                ? {}
+                : {
+                      usage: {
+                          prompt_tokens: call === 1 ? 0 : 12,
+                          completion_tokens: call === 1 ? 0 : 7,
+                          total_tokens: call === 1 ? 0 : 19,
+                      },
+                  }),
+        }),
+        { headers: { 'content-type': 'application/json' } },
+    );
 }

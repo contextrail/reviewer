@@ -1,55 +1,47 @@
-import { findReviewComment, withHistory } from './history.mjs';
-import { appendFileSync, readFileSync } from 'node:fs';
+import { appendFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { config, currentPR, githubRequest, e, eligible, fail, guarded, output, read } from './common.mjs';
-
+import { config, e, fail, guarded, loadReviewerModule, output, read, write } from './common.mjs';
 await guarded('comment', async () => {
-    const finish = (status, url = '') => {
-        output('comment-status', status);
-        appendFileSync(e.GITHUB_STEP_SUMMARY, `\nPR comment: ${status}.${url ? ` [View comment](${url})` : ''}\n`);
-    };
     try {
-        const c = config();
-        if (
-            !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(c.repository ?? '') ||
-            !Number.isSafeInteger(c.pr) ||
-            c.pr < 1 ||
-            typeof c.reviewer !== 'string' ||
-            !/^[1-9][0-9]*$/.test(e.GITHUB_RUN_ID ?? '') ||
-            !/^[1-9][0-9]*$/.test(e.GITHUB_RUN_ATTEMPT ?? '') ||
-            !e.GH_READ_TOKEN
-        )
-            fail('invalid_configuration');
-        const summary = readFileSync(join(e.REVIEW_ROOT, 'summary.md'), 'utf8');
-        if (!summary || summary.length > 50000) fail('comment_summary_invalid');
-        const previous = await findReviewComment(c);
-        const old = previous?.body.match(/\n<!-- contextrail-run:([1-9][0-9]*):([1-9][0-9]*) -->\n/);
-        if (
-            old &&
-            (BigInt(old[1]) > BigInt(e.GITHUB_RUN_ID) ||
-                (old[1] === e.GITHUB_RUN_ID && BigInt(old[2]) > BigInt(e.GITHUB_RUN_ATTEMPT)))
-        )
-            return finish('skipped_newer');
-        // Recheck after listing: a report for a moved PR must not replace its current comment.
-        const pr = await currentPR(c),
-            fixed = read(join(e.REVIEW_ROOT, 'comparison.json'));
-        if (!eligible(pr, c)) fail('ineligible_pr');
-        if (fixed && (fixed.base !== pr.base.sha || fixed.head !== pr.head.sha)) return finish('skipped_superseded');
-        const current = read(join(e.REVIEW_ROOT, 'comment-run.json'));
-        if (!current || current.row.id !== e.GITHUB_RUN_ID || current.row.attempt !== Number(e.GITHUB_RUN_ATTEMPT))
-            fail('history_invalid');
-        const body = withHistory(summary, previous, current, c);
-        const result = previous
-            ? await githubRequest(c, `/issues/comments/${previous.id}`, 'PATCH', { body })
-            : await githubRequest(c, `/issues/${c.pr}/comments`, 'POST', { body });
-        if (!Number.isSafeInteger(result?.id) || result.id < 1) fail('comment_acknowledgement_invalid');
-        finish(
-            previous ? 'updated' : 'created',
-            `https://github.com/${c.repository}/pull/${c.pr}#issuecomment-${result.id}`,
+        const c = config(),
+            { publishGitHubReview } = await loadReviewerModule('github');
+        // Summary has already selected the only comparison-bound run. A startup failure uses
+        // the same package renderer, without inventing an assessment or silently posting it inline.
+        const record = read(join(e.REVIEW_ROOT, 'comment-run.json'));
+        const run = record?.row?.cliRunId;
+        let input = read(join(e.REVIEW_ROOT, 'github-input.json'));
+        if (!input) {
+            const f = read(join(e.REVIEW_ROOT, 'comparison.json'));
+            input = {
+                version: 1,
+                repository: c.repository,
+                pr: c.pr,
+                reviewer: c.reviewer,
+                base: f.base,
+                head: f.head,
+                baseBranch: c.baseBranch ?? '',
+                githubRun: e.GITHUB_RUN_ID,
+                githubAttempt: Number(e.GITHUB_RUN_ATTEMPT),
+            };
+            write(join(e.REVIEW_ROOT, 'github-input.json'), input);
+        }
+        const result = await publishGitHubReview({
+            runDir: run ? join(e.REVIEW_ROOT, 'comparison/.contextrail/reviewer', run) : e.REVIEW_ROOT,
+            githubDir: e.REVIEW_ROOT,
+            postComment: true,
+            inlineComments: c.inlineComments ?? e.INLINE_COMMENTS === 'true',
+            artifactUrl: e.ARTIFACT_URL,
+            token: e.GH_READ_TOKEN,
+        });
+        output('comment-status', result.status.startsWith('skipped_') ? result.status : result.commentStatus);
+        appendFileSync(
+            e.GITHUB_STEP_SUMMARY,
+            `\nPR comment: ${result.commentStatus}; inline: ${result.inlineStatus} (${result.omittedInline} omitted, ${result.duplicateInline} existing).${result.commentUrl ? ` [View comment](${result.commentUrl})` : ''}\n`,
         );
+        if (result.exitCode) fail('comment_failed');
     } catch {
-        finish('failed');
-        // No upstream error body/message or token is copied to logs; no automatic write retry.
+        output('comment-status', 'failed');
+        appendFileSync(e.GITHUB_STEP_SUMMARY, '\nPR comment: failed.\n');
         fail('comment_failed');
     }
 });

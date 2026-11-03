@@ -19,8 +19,12 @@ export {
     type SearchResult,
 } from './source.js';
 export { runReview, DEFAULT_EXECUTION_LIMITS, type ExecutionLimits, type ReviewState } from './review.js';
+export { loadReviewCheckpoint, type ReviewCheckpoint } from './resume.js';
 export { reviewModel, type ProviderConfiguration, type ReviewProvider } from './providers.js';
 export { decideExit, DEFAULT_POLICY, type ReviewPolicy, type AcceptedResult } from './results.js';
 
 export { projectReviewReport, sendReviewReport, type ReportingStatus, type ReviewFeedbackSender } from './feedback.js';
 export { reviewReportInputSchema, type ReviewReportInput, type ReviewReportReceipt } from './report-contract.js';
+export { createPhaseRecord, validatePhaseRecord, phaseRecordSchema, type PhaseRecord } from './phases.js';
+export { prepareGitHubReview, publishGitHubReview } from './github.js';
+export { renderReviewComment, renderActionSummary } from './presentation.js';

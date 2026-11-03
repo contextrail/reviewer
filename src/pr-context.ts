@@ -2,7 +2,7 @@ import { closeSync, fstatSync, openSync, readSync } from 'node:fs';
 import { z } from 'zod';
 import type { GitIdentity } from './prepare.js';
 
-export const MAX_PR_CONTEXT_BYTES = 200 * 1024;
+const MAX_PR_CONTEXT_BYTES = 200 * 1024;
 const sha = z.string().regex(/^[a-f0-9]{40}$/);
 const text = (max: number) => z.string().max(max);
 const disposition = z.enum(['evaluated', 'unresolved', 'not_applicable', 'not_evaluated']);
@@ -39,8 +39,7 @@ const run = z.strictObject({
     packageVersion: text(100),
     reviewerVersion: z.number().nonnegative().nullable(),
 });
-export const prContextSchema = z.strictObject({
-    version: z.literal(1),
+const contextFields = {
     repository: text(301).regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/),
     pr: z.number().int().positive(),
     reviewer: text(500).startsWith('skill://'),
@@ -97,7 +96,27 @@ export const prContextSchema = z.strictObject({
         files: z.array(z.strictObject({ path: text(500), status: text(50) })).max(100),
     }),
     limitations: z.array(text(300)).max(12),
+};
+const phaseModel = z.strictObject({
+    phase: z.enum(['plan', 'assess', 'verify']),
+    provider: z.enum(['openai', 'openrouter']),
+    model: text(200),
+    effort: text(20).optional(),
 });
+const v1 = z.strictObject({ version: z.literal(1), ...contextFields });
+const v2 = z.strictObject({
+    version: z.literal(2),
+    ...contextFields,
+    intent: z.strictObject({
+        title: text(1000),
+        body: text(20000),
+        source: z.enum(['github_pull_request', 'caller']),
+    }),
+    history: contextFields.history.extend({
+        runs: z.array(run.extend({ phaseModels: z.array(phaseModel).max(3).optional() })).max(10),
+    }),
+});
+export const prContextSchema = z.discriminatedUnion('version', [v1, v2]);
 export type PrContext = z.infer<typeof prContextSchema>;
 /** This binds advisory data to the current comparison; parsing does not authenticate its claims. */
 export function parsePrContext(value: unknown, artifact: GitIdentity, reviewer: string): PrContext {

@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { passiveGitEnvironment } from './git.js';
+import { MAX_PREPARATION_BYTES, passiveGitEnvironment, sensitiveGitPath } from './git.js';
 import type { GitIdentity } from './prepare.js';
 
 export type SourceSide = 'base' | 'head';
@@ -12,11 +12,36 @@ export type SourceEntry = Snapshot & {
     kind: 'file' | 'symlink' | 'submodule';
 };
 export type SourceChange = {
+    offset: number;
     kind: 'addition' | 'modification' | 'deletion' | 'rename' | 'type_change';
     base: SourceEntry | null;
     head: SourceEntry | null;
     similarity: number | null;
 };
+export type ChangeInventory = {
+    base: Snapshot;
+    head: Snapshot;
+    status: 'complete' | 'truncated';
+    items: SourceChange[];
+    next: { offset: number; detectRenames: boolean } | null;
+    renameDetection: 'heuristic' | 'disabled';
+    excludedPaths: string[];
+    reason?: string;
+};
+type PreparedDiff = {
+    change: SourceChange;
+    status: 'complete' | 'truncated' | 'unsupported';
+    reason?: string;
+    patch: string;
+    hash: string;
+};
+export type DiffRequest = { offset?: number; patchLineOffset?: number; detectRenames?: boolean };
+export type DiffPage = Page<PreparedDiff, { offset: number; patchLineOffset: number; detectRenames: boolean }> & {
+    base: Snapshot;
+    head: Snapshot;
+    renameDetection: 'heuristic' | 'disabled';
+};
+const sensitiveSourcePath = sensitiveGitPath;
 export type SourceLimits = {
     pageEntries: number;
     searchMatches: number;
@@ -84,6 +109,102 @@ function safePath(path: string) {
 }
 function kind(mode: string): SourceEntry['kind'] {
     return mode === '160000' ? 'submodule' : mode === '120000' ? 'symlink' : 'file';
+}
+
+type DiffBudget = { bytes: number; lines: number };
+type PatchProgress = { line: number; skip: number };
+function acceptPatchLine(
+    item: PreparedDiff,
+    line: string,
+    progress: PatchProgress,
+    budget: DiffBudget,
+    limits: SourceLimits,
+): boolean {
+    if (progress.line++ < progress.skip) return true;
+    const size = Buffer.byteLength(line);
+    if (budget.bytes + size > limits.readBytes || budget.lines >= limits.readLines) {
+        if (!item.patch && budget.bytes === 0 && size > limits.readBytes) {
+            item.status = 'unsupported';
+            item.reason = 'diff_line_exceeds_response_limit';
+        } else item.status = 'truncated';
+        progress.line--;
+        return false;
+    }
+    budget.bytes += size;
+    budget.lines++;
+    item.patch += line;
+    return true;
+}
+
+/** One bounded read window; positions use UTF-16 columns while budgets count UTF-8 bytes. */
+class ReadWindow {
+    readonly fragments: ReadResult['fragments'] = [];
+    line = 1;
+    column = 0;
+    private bytes = 0;
+    private found = false;
+    private fragment: ReadResult['fragments'][number] | undefined;
+    constructor(
+        private start: SourcePosition,
+        private endLine: number,
+        private limits: SourceLimits,
+    ) {}
+    accept(char: string): 'complete' | 'truncated' | null {
+        if (this.line === this.start.line && this.column > this.start.column && !this.found)
+            throw new SourceAccessError(
+                'invalid_input',
+                'start.column splits a Unicode character or exceeds the line.',
+            );
+        if (this.line > this.endLine) return 'complete';
+        const inWindow =
+            this.line > this.start.line || (this.line === this.start.line && this.column >= this.start.column);
+        if (inWindow && !this.append(char)) return 'truncated';
+        this.advance(char);
+        return null;
+    }
+    private append(char: string): boolean {
+        this.found = true;
+        const bytes = Buffer.byteLength(char);
+        if (
+            (!this.fragment && this.fragments.length === this.limits.readLines) ||
+            this.bytes + bytes > this.limits.readBytes
+        )
+            return false;
+        if (!this.fragment) {
+            this.fragment = { line: this.line, column: this.column, text: '' };
+            this.fragments.push(this.fragment);
+        }
+        this.fragment.text += char;
+        this.bytes += bytes;
+        return true;
+    }
+    private advance(char: string) {
+        if (char !== '\n') {
+            this.column += char.length;
+            return;
+        }
+        if (this.line === this.start.line && !this.found)
+            throw new SourceAccessError('invalid_input', 'start.column exceeds the line.');
+        this.line++;
+        this.column = 0;
+        this.fragment = undefined;
+    }
+    finish() {
+        // Empty file and a position exactly at EOF are valid empty reads; trailing LF adds no source line.
+        if (!this.found && !(this.line === this.start.line && this.column === this.start.column))
+            throw new SourceAccessError('invalid_input', 'start is beyond the source.');
+    }
+}
+
+/** UTF-16 prefix lengths preserve overlapping literal matches across blob chunks. */
+function literalPrefix(literal: string): number[] {
+    const prefix: number[] = new Array(literal.length).fill(0);
+    for (let i = 1, j = 0; i < literal.length; i++) {
+        while (j && literal[i] !== literal[j]) j = prefix[j - 1]!;
+        if (literal[i] === literal[j]) j++;
+        prefix[i] = j;
+    }
+    return prefix;
 }
 
 /** Passive committed-object access. Does not write state or evaluate guidance. */
@@ -318,6 +439,7 @@ export class FixedSnapshotSource {
                     const source = (snapshot: Snapshot, mode: string, object: string, path: string) =>
                         mode === '000000' ? null : { ...snapshot, mode, object, path, kind: kind(mode) };
                     items.push({
+                        offset: index - 1,
                         kind: (
                             { A: 'addition', D: 'deletion', M: 'modification', R: 'rename', T: 'type_change' } as const
                         )[status![0] as 'A' | 'D' | 'M' | 'R' | 'T'],
@@ -340,6 +462,161 @@ export class FixedSnapshotSource {
                 next: null,
             };
         });
+    }
+    /** Complete permitted file inventory without reading patches; metadata is navigation, not assessment. */
+    async changeInventory(control: Control = {}): Promise<ChangeInventory> {
+        const inventory: ChangeInventory = {
+            base: this.snapshot('base'),
+            head: this.snapshot('head'),
+            status: 'truncated',
+            items: [],
+            next: { offset: 0, detectRenames: true },
+            renameDetection: 'heuristic',
+            excludedPaths: [],
+        };
+        // Reserve bounded room for the final reason/cursor and serialization separators.
+        let bytes = Buffer.byteLength(JSON.stringify(inventory)) + 512;
+        try {
+            return await this.operation(control, async (operation) => {
+                while (inventory.next) {
+                    const cursor = inventory.next;
+                    const page = await this.changes(cursor, { signal: operation.signal });
+                    for (const item of page.items) {
+                        const paths = [item.base?.path, item.head?.path].filter((path): path is string => !!path);
+                        const excluded = paths.some(sensitiveGitPath);
+                        const size = Buffer.byteLength(JSON.stringify(excluded ? paths : item)) + 2;
+                        if (bytes + size > MAX_PREPARATION_BYTES) {
+                            inventory.reason = 'inventory_output_limit';
+                            inventory.next = { offset: item.offset, detectRenames: true };
+                            return inventory;
+                        }
+                        bytes += size;
+                        if (excluded) inventory.excludedPaths.push(...paths);
+                        else inventory.items.push(item);
+                        inventory.next = { offset: item.offset + 1, detectRenames: true };
+                    }
+                    if (page.next && page.next.offset <= cursor.offset)
+                        throw new SourceAccessError('invalid_cursor', 'Change inventory did not advance.');
+                    inventory.next = page.next;
+                }
+                inventory.excludedPaths = [...new Set(inventory.excludedPaths)];
+                inventory.status = 'complete';
+                return inventory;
+            });
+        } catch (error) {
+            inventory.status = 'truncated';
+            inventory.next ??= { offset: 0, detectRenames: true };
+            inventory.reason = error instanceof SourceAccessError ? error.code : 'unavailable';
+            return inventory;
+        }
+    }
+    /** Ordinary unified patch fragments; continuations retain the fixed comparison. */
+    async diff(request: DiffRequest = {}, control: Control = {}): Promise<DiffPage> {
+        const offset = request.offset ?? 0;
+        const patchLineOffset = request.patchLineOffset ?? 0;
+        integer(offset, 'offset', 0);
+        integer(patchLineOffset, 'patchLineOffset', 0);
+        const changes = await this.changes({ offset, detectRenames: request.detectRenames }, control);
+        return this.operation(control, async (operation) => {
+            const items: PreparedDiff[] = [];
+            const budget: DiffBudget = { bytes: 0, lines: 0 };
+            const result = (next: DiffPage['next']): DiffPage => ({
+                base: changes.base,
+                head: changes.head,
+                renameDetection: changes.renameDetection,
+                status: next ? 'truncated' : 'complete',
+                items,
+                next,
+            });
+            for (const [index, change] of changes.items.entries()) {
+                const fileOffset = offset + index;
+                const skipLines = index === 0 ? patchLineOffset : 0;
+                const paths = [...new Set([change.base?.path, change.head?.path].filter((p): p is string => !!p))];
+                const item: PreparedDiff = { change, status: 'complete', patch: '', hash: '' };
+                const finishItem = () => {
+                    item.hash = `sha256:${createHash('sha256').update(item.patch).digest('hex')}`;
+                    items.push(item);
+                };
+                const reason = await this.diffReason(change, paths, operation);
+                if (reason) {
+                    item.status = 'unsupported';
+                    item.reason = reason;
+                    finishItem();
+                    continue;
+                }
+                const args = [
+                    '--literal-pathspecs',
+                    'diff',
+                    '--no-ext-diff',
+                    '--no-textconv',
+                    '--no-color',
+                    '--src-prefix=a/',
+                    '--dst-prefix=b/',
+                    '--unified=3',
+                    '--diff-algorithm=myers',
+                    '--no-relative',
+                    changes.renameDetection === 'heuristic' ? '--find-renames=50%' : '--no-renames',
+                    changes.base.tree,
+                    changes.head.tree,
+                    '--',
+                    ...paths,
+                ];
+                const patchLine = await this.appendPatch(item, args, skipLines, budget, operation);
+                finishItem();
+                if (item.status === 'truncated')
+                    return result({
+                        offset: fileOffset,
+                        patchLineOffset: patchLine,
+                        detectRenames: request.detectRenames ?? true,
+                    });
+                if (budget.lines >= this.limits.readLines || budget.bytes >= this.limits.readBytes)
+                    return result({
+                        offset: fileOffset + 1,
+                        patchLineOffset: 0,
+                        detectRenames: request.detectRenames ?? true,
+                    });
+            }
+            return result(changes.next ? { ...changes.next, patchLineOffset: 0 } : null);
+        });
+    }
+    private async diffReason(change: SourceChange, paths: string[], operation: Operation): Promise<string | null> {
+        if (paths.some(sensitiveSourcePath)) return 'sensitive_path_excluded';
+        for (const entry of [change.base, change.head]) {
+            if (!entry) continue;
+            const reason = await this.textReason(entry, operation);
+            if (reason) return reason;
+        }
+        return null;
+    }
+    private async appendPatch(
+        item: PreparedDiff,
+        args: string[],
+        skip: number,
+        budget: DiffBudget,
+        operation: Operation,
+    ): Promise<number> {
+        const progress: PatchProgress = { line: 0, skip };
+        const decoder = new TextDecoder('utf-8', { fatal: true });
+        let pending = '';
+        for await (const chunk of this.git(args, operation)) {
+            pending += decoder.decode(chunk, { stream: true });
+            let end: number;
+            while ((end = pending.indexOf('\n')) >= 0) {
+                const line = pending.slice(0, end + 1);
+                pending = pending.slice(end + 1);
+                if (!acceptPatchLine(item, line, progress, budget, this.limits)) return progress.line;
+            }
+            if (Buffer.byteLength(pending) > this.limits.readBytes) {
+                item.status = 'unsupported';
+                item.reason = 'diff_line_exceeds_response_limit';
+                return progress.line;
+            }
+        }
+        pending += decoder.decode();
+        if (pending) acceptPatchLine(item, pending, progress, budget, this.limits);
+        if (progress.line < skip)
+            throw new SourceAccessError('invalid_cursor', 'Patch continuation exceeds file diff.');
+        return progress.line;
     }
     private async textReason(entry: SourceEntry, operation: Operation): Promise<string | null> {
         if (entry.kind === 'submodule') return 'submodule_commit_not_source';
@@ -383,62 +660,64 @@ export class FixedSnapshotSource {
                 return { snapshot, entry, status: 'unavailable', reason: 'missing_path', fragments: [], next: null };
             const reason = await this.textReason(entry, operation);
             if (reason) return { snapshot, entry, status: 'unsupported', reason, fragments: [], next: null };
-            const fragments: ReadResult['fragments'] = [];
-            let line = 1,
-                column = 0,
-                bytes = 0,
-                lines = 0,
-                found = false;
-            let fragment: ReadResult['fragments'][number] | undefined;
+            const window = new ReadWindow(start, endLine, this.limits);
+            const result = (status: 'complete' | 'truncated'): ReadResult => ({
+                snapshot,
+                entry,
+                status,
+                fragments: window.fragments,
+                next:
+                    status === 'complete'
+                        ? null
+                        : {
+                              side: snapshot.side,
+                              path: entry.path,
+                              start: { line: window.line, column: window.column },
+                              ...(request.endLine === undefined ? {} : { endLine }),
+                          },
+            });
             for await (const chunk of this.text(entry, operation)) {
                 for (const char of chunk) {
                     operation.check();
-                    if (line === start.line && column > start.column && !found)
-                        throw new SourceAccessError(
-                            'invalid_input',
-                            'start.column splits a Unicode character or exceeds the line.',
-                        );
-                    if (line > endLine) return { snapshot, entry, status: 'complete', fragments, next: null };
-                    if (line >= start.line && (line > start.line || column >= start.column)) {
-                        found = true;
-                        if (
-                            (!fragment && lines === this.limits.readLines) ||
-                            bytes + Buffer.byteLength(char) > this.limits.readBytes
-                        )
-                            return {
-                                snapshot,
-                                entry,
-                                status: 'truncated',
-                                fragments,
-                                next: {
-                                    side: snapshot.side,
-                                    path: entry.path,
-                                    start: { line, column },
-                                    ...(request.endLine === undefined ? {} : { endLine }),
-                                },
-                            };
-                        if (!fragment) {
-                            fragment = { line, column, text: '' };
-                            fragments.push(fragment);
-                            lines++;
-                        }
-                        fragment.text += char;
-                        bytes += Buffer.byteLength(char);
-                    }
-                    if (char === '\n') {
-                        if (line === start.line && !found)
-                            throw new SourceAccessError('invalid_input', 'start.column exceeds the line.');
-                        line++;
-                        column = 0;
-                        fragment = undefined;
-                    } else column += char.length;
+                    const status = window.accept(char);
+                    if (status) return result(status);
                 }
             }
-            // Empty file and a position exactly at EOF are valid empty reads; trailing LF adds no source line.
-            if (!found && !(line === start.line && column === start.column))
-                throw new SourceAccessError('invalid_input', 'start is beyond the source.');
-            return { snapshot, entry, status: 'complete', fragments, next: null };
+            window.finish();
+            return result('complete');
         });
+    }
+    private async *literalMatches(
+        entry: SourceEntry,
+        literal: string,
+        prefix: number[],
+        minimum: number,
+        operation: Operation,
+    ): AsyncGenerator<{ match: SourceMatch; offset: number }> {
+        let position = 0,
+            line = 1,
+            column = 0,
+            matched = 0;
+        for await (const chunk of this.text(entry, operation)) {
+            for (let i = 0; i < chunk.length; i++) {
+                operation.check();
+                const char = chunk[i]!;
+                while (matched && char !== literal[matched]) matched = prefix[matched - 1]!;
+                if (char === literal[matched]) matched++;
+                if (matched === literal.length) {
+                    const offset = position - matched + 1;
+                    if (offset >= minimum)
+                        yield { match: { entry, line, column: column - matched + 1, endColumn: column + 1 }, offset };
+                    matched = prefix[matched - 1]!;
+                }
+                position++;
+                if (char === '\n') {
+                    line++;
+                    column = 0;
+                } else column++;
+            }
+        }
+        if (minimum > position) throw new SourceAccessError('invalid_cursor', 'Search cursor exceeds file length.');
     }
     async search(
         request: { side: SourceSide; literal: string; path?: string; cursor?: SearchCursor },
@@ -480,12 +759,7 @@ export class FixedSnapshotSource {
                 next,
                 evidence: 'literal_navigation_only',
             });
-            const prefix: number[] = new Array(request.literal.length).fill(0);
-            for (let i = 1, j = 0; i < request.literal.length; i++) {
-                while (j && request.literal[i] !== request.literal[j]) j = prefix[j - 1]!;
-                if (request.literal[i] === request.literal[j]) j++;
-                prefix[i] = j;
-            }
+            const prefix = literalPrefix(request.literal);
             for await (const entry of this.entries(snapshot, operation)) {
                 const entryOffset = index++;
                 if (request.path !== undefined && entry.path !== request.path) continue;
@@ -498,35 +772,18 @@ export class FixedSnapshotSource {
                     skipped.push({ entry, reason });
                     continue;
                 }
-                let position = 0,
-                    line = 1,
-                    column = 0,
-                    matched = 0;
                 const minimum = entryOffset === cursor.entryOffset ? cursor.characterOffset : 0;
-                for await (const chunk of this.text(entry, operation)) {
-                    for (let i = 0; i < chunk.length; i++) {
-                        operation.check();
-                        const char = chunk[i]!;
-                        while (matched && char !== request.literal[matched]) matched = prefix[matched - 1]!;
-                        if (char === request.literal[matched]) matched++;
-                        if (matched === request.literal.length) {
-                            const start = position - matched + 1;
-                            if (start >= minimum) {
-                                items.push({ entry, line, column: column - matched + 1, endColumn: column + 1 });
-                                if (items.length === this.limits.searchMatches)
-                                    return result({ scope, entryOffset, characterOffset: start + 1 });
-                            }
-                            matched = prefix[matched - 1]!;
-                        }
-                        position++;
-                        if (char === '\n') {
-                            line++;
-                            column = 0;
-                        } else column++;
-                    }
+                for await (const { match, offset } of this.literalMatches(
+                    entry,
+                    request.literal,
+                    prefix,
+                    minimum,
+                    operation,
+                )) {
+                    items.push(match);
+                    if (items.length === this.limits.searchMatches)
+                        return result({ scope, entryOffset, characterOffset: offset + 1 });
                 }
-                if (minimum > position)
-                    throw new SourceAccessError('invalid_cursor', 'Search cursor exceeds file length.');
             }
             if (cursor.entryOffset > index)
                 throw new SourceAccessError('invalid_cursor', 'Search cursor exceeds snapshot paths.');

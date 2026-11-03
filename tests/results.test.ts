@@ -1,6 +1,15 @@
+import { reconcileFindings, type ReviewFinding } from '../src/assessment.js';
 import { describe, expect, it } from 'vitest';
 import { reportedUsage } from '../src/providers.js';
-import { EvidenceLedger } from '../src/evidence.js';
+import {
+    CitationError,
+    EvidenceLedger,
+    citationSchema,
+    selectionSchema,
+    modelEvidence,
+    resolveCitationSelections,
+    MAX_SUBMISSION_QUOTE_BYTES,
+} from '../src/evidence.js';
 import { DEFAULT_POLICY, decideExit, validateResult, type ReviewEntry } from '../src/results.js';
 import type { Publication } from '../src/contracts.js';
 
@@ -73,6 +82,54 @@ describe('pinned citation validation and explicit revision', () => {
         expect(() => validateResult(input, entries, ledger)).toThrow('Duplicate/stale');
         expect(validateResult({ ...input, revisionOf: 1 }, entries, ledger).revision).toBe(2);
     });
+    it('identifies the exact failed result citation without retaining rejected content', () => {
+        const { ledger, entries, input, s } = fixture();
+        const quote = 'REJECTED_QUOTE_MUST_NOT_ENTER_ERRORS';
+        try {
+            validateResult({ ...input, citations: [input.citations[0], { ref: s.ref, quote }] }, entries, ledger, [
+                'assessments',
+                0,
+                'result',
+            ]);
+            expect.fail('invalid quotation accepted');
+        } catch (error) {
+            expect(error).toBeInstanceOf(CitationError);
+            expect(error).toMatchObject({
+                code: 'citation_absent',
+                path: ['assessments', 0, 'result', 'citations', 1],
+                ref: s.ref,
+            });
+            expect(JSON.stringify(error)).not.toContain(quote);
+            expect(String(error)).not.toContain(quote);
+        }
+        const malicious = 'UNKNOWN_REF_WITH_PRIVATE_CONTENT';
+        try {
+            ledger.cite({ ref: malicious, quote }, ['citations', 0]);
+            expect.fail('unknown reference accepted');
+        } catch (error) {
+            expect(error).toMatchObject({ code: 'citation_unknown', ref: null, path: ['citations', 0] });
+            expect((error as CitationError).refHash).toMatch(/^sha256:[a-f0-9]{64}$/);
+            expect(JSON.stringify(error)).not.toContain(malicious);
+            expect(String(error)).not.toContain(malicious);
+        }
+        const repeated = ledger.add('same same', {});
+        expect(() => ledger.cite({ ref: repeated.ref, quote: 'same' })).toThrow('ambiguous');
+        expect(() => ledger.cite({ ref: s.ref, quote: 'authorize(actor); return document;' })).toThrow('Quote absent');
+        expect(ledger.cite({ ref: s.ref, quote: 'authorize(actor);\nreturn document;' })).toMatchObject({ start: 0 });
+    });
+    it.each(['__proto__', 'constructor', 'toString'])(
+        'rejects inherited evidence key %s with targeted feedback',
+        (ref) => {
+            const { ledger } = fixture();
+            try {
+                ledger.cite({ ref, quote: 'text' }, ['citations', 0]);
+                expect.fail('inherited reference accepted');
+            } catch (error) {
+                expect(error).toBeInstanceOf(CitationError);
+                expect(error).toMatchObject({ code: 'citation_unknown', ref: null, path: ['citations', 0] });
+            }
+        },
+    );
     it('rejects absent/ambiguous quotes, unknown references and wrong pinned contexts', () => {
         const { ledger, entries, input, p } = fixture();
         for (const citation of [
@@ -181,5 +238,226 @@ it('never treats partial provider usage fields as reported zeroes', () => {
         totalTokens: null,
         raw: null,
         missing: 'provider_did_not_report',
+    });
+});
+
+describe('exact issue reconciliation across governed contexts', () => {
+    const finding = (): ReviewFinding => ({
+        findingId: 'finding:a',
+        assessmentIds: ['assessment:a'],
+        checkIds: ['check:a'],
+        classification: 'binding_violation',
+        locationRefs: [
+            {
+                ref: 'evidence:source',
+                quote: 'return document;',
+                start: 0,
+                end: 16,
+                location: { line: 1, column: 0 },
+                provenance: {
+                    kind: 'source',
+                    side: 'head',
+                    commit: 'a'.repeat(40),
+                    path: 'route.ts',
+                    object: 'b'.repeat(40),
+                },
+            },
+        ],
+        explanation: 'Return bypasses authorization.',
+        consequence: 'Unauthorized disclosure.',
+        correction: 'Authorize before return.',
+        limitations: ['Source inspection.'],
+        verified: true,
+    });
+    it('merges exact independently verified issue accounts while preserving every criterion and source finding identity', () => {
+        const first = finding(),
+            second = { ...finding(), findingId: 'finding:b', assessmentIds: ['assessment:b'], checkIds: ['check:b'] };
+        const result = reconcileFindings([second, first]);
+        expect(result).toHaveLength(1);
+        expect(result[0]).toMatchObject({
+            assessmentIds: ['assessment:a', 'assessment:b'],
+            checkIds: ['check:a', 'check:b'],
+            sourceFindingIds: ['finding:a', 'finding:b'],
+            verified: true,
+        });
+        expect(first.assessmentIds).toEqual(['assessment:a']);
+    });
+    it('does not erase issues with different consequences, corrections, classifications or verification status', () => {
+        const first = finding();
+        expect(reconcileFindings([first, { ...finding(), consequence: 'Different supported impact.' }])).toHaveLength(
+            2,
+        );
+        expect(reconcileFindings([first, { ...finding(), correction: 'Different correction.' }])).toHaveLength(2);
+        expect(reconcileFindings([first, { ...finding(), classification: 'guidance_departure' }])).toHaveLength(2);
+        expect(reconcileFindings([first, { ...finding(), verified: false }])).toHaveLength(2);
+    });
+});
+
+describe('code-owned quotations from evidence-relative segments', () => {
+    it.each([
+        ['', []],
+        ['last', ['last']],
+        ['a\n', ['a\n']],
+        ['\n\n', ['\n', '\n']],
+        ['α\r\n\r\n🌱\nlast', ['α\r\n', '\r\n', '🌱\n', 'last']],
+        ['a\rb', ['a\r', 'b']],
+    ] as Array<[string, string[]]>)('preserves exact line text and EOF boundaries for %j', (text, expected) => {
+        const ledger = new EvidenceLedger(),
+            record = ledger.add(text, { kind: 'source', path: 'fixture.ts' }),
+            view = modelEvidence(record);
+        expect(Object.keys(view)).toEqual(['ref', 'provenance', 'segments']);
+        expect(view.segments).toEqual(expected.map((text, index) => ({ index: index + 1, text })));
+        expect(view.segments.map((s) => s.text).join('')).toBe(text);
+        expect(view.segments.every((s) => s.text.length > 0)).toBe(true);
+    });
+    it('selects repeated line occurrences unambiguously by position without fuzzy matching', () => {
+        const ledger = new EvidenceLedger(),
+            record = ledger.add('same\nsame\n', { kind: 'source' });
+        const selected = ledger.select({ ref: record.ref, startSegment: 2, endSegment: 2 });
+        expect(selected).toMatchObject({ ref: record.ref, quote: 'same\n', start: 5, end: 10 });
+        expect(
+            ledger.cite({ ref: selected.ref, quote: selected.quote, start: selected.start, end: selected.end }),
+        ).toEqual(selected);
+        expect(() => ledger.cite({ ref: record.ref, quote: 'same\n' })).toThrow(CitationError);
+        expect(() => ledger.cite({ ref: record.ref, quote: 'SAME\n', start: 5, end: 10 })).toThrow(CitationError);
+    });
+    it('maps partial source fragments using evidence-relative indices and exact Unicode/CRLF offsets', () => {
+        const ledger = new EvidenceLedger(),
+            snapshot = { side: 'head' as const, commit: 'a'.repeat(40), tree: 'b'.repeat(40) };
+        const record = ledger.source({
+            snapshot,
+            entry: { ...snapshot, path: 'partial.ts', object: 'c'.repeat(40), mode: '100644', kind: 'file' },
+            status: 'truncated',
+            fragments: [
+                { line: 41, column: 7, text: 'α\r\n' },
+                { line: 42, column: 0, text: '🌱\r\n' },
+                { line: 43, column: 0, text: 'last' },
+            ],
+            next: { side: 'head', path: 'partial.ts', start: { line: 43, column: 4 } },
+        })!;
+        const selected = ledger.select({ ref: record.ref, startSegment: 2, endSegment: 3 });
+        expect(selected).toMatchObject({ quote: '🌱\r\nlast', start: 3, end: 11, location: { line: 42, column: 0 } });
+        expect(ledger.select({ ref: record.ref, startSegment: 1, endSegment: 1 }).location).toEqual({
+            line: 41,
+            column: 7,
+        });
+        expect(record.text.slice(selected.start, selected.end)).toBe(selected.quote);
+    });
+    it.each([
+        [0, 1, 'startSegment'],
+        [-1, 1, 'startSegment'],
+        [1.5, 2, 'startSegment'],
+        [Infinity, 2, 'startSegment'],
+        [3, 3, 'startSegment'],
+        [1, 0, 'endSegment'],
+        [2, 1, 'endSegment'],
+        [1, 3, 'endSegment'],
+    ] as Array<[number, number, string]>)(
+        'rejects invalid selection %s..%s at the specific field',
+        (startSegment, endSegment, field) => {
+            const ledger = new EvidenceLedger(),
+                record = ledger.add('PRIVATE_LINE_ONE\nPRIVATE_LINE_TWO', { kind: 'source' });
+            let failure: unknown;
+            try {
+                ledger.select({ ref: record.ref, startSegment, endSegment }, ['assessments', 0, 'citations', 1]);
+            } catch (error) {
+                failure = error;
+            }
+            expect(failure).toBeInstanceOf(CitationError);
+            expect(failure).toMatchObject({
+                code: 'citation_range_invalid',
+                path: ['assessments', 0, 'citations', 1, field],
+                ref: record.ref,
+            });
+            expect(JSON.stringify(failure)).not.toContain('PRIVATE_LINE');
+        },
+    );
+    it('rejects unknown prototype-key refs and empty-record ranges with content-free typed errors', () => {
+        const ledger = new EvidenceLedger();
+        for (const ref of ['constructor', '__proto__', 'PRIVATE_UNKNOWN_REF']) {
+            let failure: unknown;
+            try {
+                ledger.select({ ref, startSegment: 1, endSegment: 1 }, ['citations', 0]);
+            } catch (error) {
+                failure = error;
+            }
+            expect(failure).toBeInstanceOf(CitationError);
+            expect(failure).toMatchObject({ code: 'citation_unknown', path: ['citations', 0, 'ref'], ref: null });
+            expect(String(failure)).not.toContain(ref);
+        }
+        const empty = ledger.add('', { kind: 'source' });
+        expect(() => ledger.select({ ref: empty.ref, startSegment: 1, endSegment: 1 })).toThrow(CitationError);
+        expect(modelEvidence(empty).segments).toEqual([]);
+    });
+    it('requires paired canonical offsets and validates exact offset bounds', () => {
+        const ledger = new EvidenceLedger(),
+            record = ledger.add('abcd', { kind: 'source' }),
+            base = { ref: record.ref, quote: 'bc' };
+        expect(citationSchema.safeParse(base).success).toBe(true);
+        expect(citationSchema.safeParse({ ...base, start: 1 }).success).toBe(false);
+        expect(citationSchema.safeParse({ ...base, end: 3 }).success).toBe(false);
+        expect(ledger.cite({ ...base, start: 1, end: 3 })).toMatchObject({ quote: 'bc', start: 1, end: 3 });
+        for (const offsets of [
+            { start: -1, end: 3 },
+            { start: 1, end: 1 },
+            { start: 1, end: 5 },
+            { start: 0, end: 2 },
+        ])
+            expect(() => ledger.cite({ ...base, ...offsets })).toThrow(CitationError);
+    });
+    it('resolves nested strict selections to canonical inputs without exposing a quote escape hatch', () => {
+        const ledger = new EvidenceLedger(),
+            record = ledger.add('first\nsecond', { kind: 'source' });
+        const selector = { ref: record.ref, startSegment: 2, endSegment: 2 },
+            input = {
+                assessments: [{ result: { citations: [selector] }, checks: [{ sourceRefs: [selector] }] }],
+                flag: false,
+                note: 'unchanged',
+            };
+        const resolved = resolveCitationSelections(input, ledger) as typeof input & {
+            assessments: Array<{ result: { citations: unknown[] }; checks: Array<{ sourceRefs: unknown[] }> }>;
+        };
+        const expected = { ref: record.ref, quote: 'second', start: 6, end: 12 };
+        expect(resolved.assessments[0]!.result.citations[0]).toEqual(expected);
+        expect(resolved.assessments[0]!.checks[0]!.sourceRefs[0]).toEqual(expected);
+        expect(resolved.flag).toBe(false);
+        expect(input.assessments[0]!.result.citations[0]).toBe(selector);
+        expect(selectionSchema.safeParse({ ...selector, quote: 'first' }).success).toBe(false);
+        expect(() => resolveCitationSelections({ citations: [{ ref: record.ref, quote: 'first' }] }, ledger)).toThrow(
+            CitationError,
+        );
+    });
+    it('applies the remaining extraction allowance before accepting a selected range', () => {
+        const ledger = new EvidenceLedger();
+        const record = ledger.add('🌱', { kind: 'source' });
+        const selection = { ref: record.ref, startSegment: 1, endSegment: 1 };
+        expect(ledger.select(selection, ['passage'], 4).quote).toBe('🌱');
+        for (const remaining of [3, 0, -1, Number.NaN, Number.POSITIVE_INFINITY])
+            expect(() => ledger.select(selection, ['passage'], remaining)).toThrowError(
+                expect.objectContaining({ code: 'citation_range_invalid', path: ['passage', 'endSegment'] }),
+            );
+    });
+    it('bounds UTF-8 quotation expansion per selection and across one submission', () => {
+        const ledger = new EvidenceLedger(),
+            allowed = ledger.add('🌱'.repeat(16384), { kind: 'source' }),
+            tooLarge = ledger.add('🌱'.repeat(16385), { kind: 'source' });
+        expect(Buffer.byteLength(ledger.select({ ref: allowed.ref, startSegment: 1, endSegment: 1 }).quote)).toBe(
+            65536,
+        );
+        expect(() => ledger.select({ ref: tooLarge.ref, startSegment: 1, endSegment: 1 })).toThrow(CitationError);
+        const selection = { ref: allowed.ref, startSegment: 1, endSegment: 1 };
+        expect(MAX_SUBMISSION_QUOTE_BYTES).toBe(1024 * 1024);
+        expect(
+            (resolveCitationSelections({ citations: Array(16).fill(selection) }, ledger) as { citations: unknown[] })
+                .citations,
+        ).toHaveLength(16);
+        let failure: unknown;
+        try {
+            resolveCitationSelections({ citations: Array(17).fill(selection) }, ledger);
+        } catch (error) {
+            failure = error;
+        }
+        expect(failure).toBeInstanceOf(CitationError);
+        expect(failure).toMatchObject({ code: 'citation_range_invalid', path: ['citations', 16, 'endSegment'] });
     });
 });

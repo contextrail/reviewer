@@ -1,6 +1,5 @@
 import type { LanguageModel } from 'ai';
 import { createOpenAI } from '@ai-sdk/openai';
-import { createOpenRouter } from '@openrouter/ai-sdk-provider';
 
 export type ReviewProvider = 'openai' | 'openrouter';
 export type ProviderConfiguration = {
@@ -9,55 +8,98 @@ export type ProviderConfiguration = {
     effort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
 };
 
+function providerErrorMessage(body: unknown): string {
+    const object = body && typeof body === 'object' ? (body as Record<string, unknown>) : null;
+    const error = object?.error;
+    const message = error && typeof error === 'object' ? (error as Record<string, unknown>).message : null;
+    return typeof message === 'string' ? message.slice(0, 1000) : '';
+}
+
+/** Classify known HTTP failures without persisting provider messages or metadata. */
+export const PROVIDER_FAILURE_CODES = [
+    'provider_credit_limit',
+    'provider_credential_invalid',
+    'provider_rate_limited',
+    'provider_permission_denied',
+    'provider_schema_invalid',
+    'provider_unavailable',
+    'provider_request_failed',
+] as const;
+export type ProviderFailureCode = (typeof PROVIDER_FAILURE_CODES)[number];
+export function providerHttpFailure(status: number, body: unknown): ProviderFailureCode {
+    const knownMessage = providerErrorMessage(body);
+    if (status === 402 || (status === 403 && /\bkey spending limit exceeded\b/iu.test(knownMessage)))
+        return 'provider_credit_limit';
+    if (status === 401) return 'provider_credential_invalid';
+    if (status === 429) return 'provider_rate_limited';
+    if (status === 403) return 'provider_permission_denied';
+    if (status === 400 && /\binvalid (?:json )?schema\b/iu.test(knownMessage)) return 'provider_schema_invalid';
+    if (status >= 500 && status <= 599) return 'provider_unavailable';
+    return 'provider_request_failed';
+}
+
+const categories = new Set([
+    'AI_APICallError',
+    'AI_TypeValidationError',
+    'AI_JSONParseError',
+    'ZodError',
+    'SyntaxError',
+]);
+const fields = new Set([
+    'choices',
+    'message',
+    'role',
+    'content',
+    'reasoning',
+    'reasoning_details',
+    'type',
+    'data',
+    'format',
+    'id',
+    'index',
+    'text',
+    'summary',
+    'signature',
+    'tool_calls',
+    'function',
+    'name',
+    'arguments',
+    'finish_reason',
+    'usage',
+    'prompt_tokens',
+    'completion_tokens',
+    'total_tokens',
+    'error',
+    'code',
+    'output',
+    'status',
+    'annotations',
+    'images',
+]);
+const types = new Set(['string', 'number', 'integer', 'boolean', 'array', 'object', 'null', 'undefined']);
+const codes = new Set(['invalid_type', 'invalid_value', 'too_big', 'too_small', 'invalid_format', 'unrecognized_keys']);
+function diagnosticValueAt(value: unknown, path: unknown[]) {
+    let actual = value;
+    for (const key of path) {
+        actual =
+            actual && typeof actual === 'object' && (typeof key === 'string' || typeof key === 'number')
+                ? (actual as Record<string | number, unknown>)[key]
+                : undefined;
+    }
+    return actual;
+}
+function diagnosticPathPart(key: unknown): string | number {
+    if (typeof key === 'number' && Number.isSafeInteger(key) && key >= 0) return key;
+    return typeof key === 'string' && fields.has(key) ? key : '[field]';
+}
+function diagnosticType(value: unknown, available: boolean) {
+    if (!available) return 'unavailable';
+    if (value === null) return 'null';
+    return Array.isArray(value) ? 'array' : typeof value;
+}
+
 /** Capture schema failures without copying exception messages, response values or arbitrary field names. */
 export function providerFailureDiagnostics(error: unknown) {
-    const categories = new Set([
-        'AI_APICallError',
-        'AI_TypeValidationError',
-        'AI_JSONParseError',
-        'ZodError',
-        'SyntaxError',
-    ]);
-    const fields = new Set([
-        'choices',
-        'message',
-        'role',
-        'content',
-        'reasoning',
-        'reasoning_details',
-        'type',
-        'data',
-        'format',
-        'id',
-        'index',
-        'text',
-        'summary',
-        'signature',
-        'tool_calls',
-        'function',
-        'name',
-        'arguments',
-        'finish_reason',
-        'usage',
-        'prompt_tokens',
-        'completion_tokens',
-        'total_tokens',
-        'error',
-        'code',
-        'output',
-        'status',
-        'annotations',
-        'images',
-    ]);
-    const types = new Set(['string', 'number', 'integer', 'boolean', 'array', 'object', 'null', 'undefined']);
-    const codes = new Set([
-        'invalid_type',
-        'invalid_value',
-        'too_big',
-        'too_small',
-        'invalid_format',
-        'unrecognized_keys',
-    ]);
     const causes: string[] = [];
     const validation: Array<{ code: string; path: Array<string | number>; expected: string; actual: string }> = [];
     let value: unknown;
@@ -71,30 +113,11 @@ export function providerFailureDiagnostics(error: unknown) {
             }
             if (!codes.has(issue.code) || !Array.isArray(issue.path)) continue;
             const path = issue.path.slice(0, 16) as unknown[];
-            let actual = value;
-            for (const key of path) {
-                actual =
-                    actual && typeof actual === 'object' && (typeof key === 'string' || typeof key === 'number')
-                        ? (actual as Record<string | number, unknown>)[key]
-                        : undefined;
-            }
             validation.push({
                 code: issue.code,
-                path: path.map((key) =>
-                    typeof key === 'number' && Number.isSafeInteger(key) && key >= 0
-                        ? key
-                        : typeof key === 'string' && fields.has(key)
-                          ? key
-                          : '[field]',
-                ),
+                path: path.map(diagnosticPathPart),
                 expected: types.has(issue.expected) ? issue.expected : 'unavailable',
-                actual: !hasValue
-                    ? 'unavailable'
-                    : actual === null
-                      ? 'null'
-                      : Array.isArray(actual)
-                        ? 'array'
-                        : typeof actual,
+                actual: diagnosticType(diagnosticValueAt(value, path), hasValue),
             });
         }
     };
@@ -128,11 +151,21 @@ export function reviewModel(
         };
     }
     return {
-        model: createOpenRouter({ apiKey: key, fetch: fetcher }).chat(config.model, {
-            usage: { include: true },
-            ...(config.effort ? { reasoning: { effort: config.effort, exclude: true } } : {}),
-        }),
-        providerOptions: {},
+        // The OpenRouter adapter currently drops function.strict. The existing
+        // OpenAI-compatible chat adapter forwards it without rewriting requests.
+        model: createOpenAI({
+            apiKey: key,
+            baseURL: 'https://openrouter.ai/api/v1',
+            name: 'openrouter',
+            fetch: fetcher,
+        }).chat(config.model),
+        providerOptions: {
+            openai: {
+                store: false,
+                forceReasoning: true,
+                ...(config.effort ? { reasoningEffort: config.effort } : {}),
+            },
+        },
     };
 }
 
@@ -141,15 +174,25 @@ export function reportedUsage(provider: ReviewProvider, value: unknown) {
     const raw = value && typeof value === 'object' ? (value as Record<string, unknown>) : null;
     const number = (value: unknown) =>
         typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
-    const inputDetails = raw?.[provider === 'openai' ? 'input_tokens_details' : 'prompt_tokens_details'] as
-        | Record<string, unknown>
-        | undefined;
-    const outputDetails = raw?.[provider === 'openai' ? 'output_tokens_details' : 'completion_tokens_details'] as
-        | Record<string, unknown>
-        | undefined;
+    const names =
+        provider === 'openai'
+            ? {
+                  input: 'input_tokens',
+                  output: 'output_tokens',
+                  inputDetails: 'input_tokens_details',
+                  outputDetails: 'output_tokens_details',
+              }
+            : {
+                  input: 'prompt_tokens',
+                  output: 'completion_tokens',
+                  inputDetails: 'prompt_tokens_details',
+                  outputDetails: 'completion_tokens_details',
+              };
+    const inputDetails = raw?.[names.inputDetails] as Record<string, unknown> | undefined;
+    const outputDetails = raw?.[names.outputDetails] as Record<string, unknown> | undefined;
     return {
-        inputTokens: number(raw?.[provider === 'openai' ? 'input_tokens' : 'prompt_tokens']),
-        outputTokens: number(raw?.[provider === 'openai' ? 'output_tokens' : 'completion_tokens']),
+        inputTokens: number(raw?.[names.input]),
+        outputTokens: number(raw?.[names.output]),
         totalTokens: number(raw?.total_tokens),
         cachedInputTokens: number(inputDetails?.cached_tokens),
         reasoningTokens: number(outputDetails?.reasoning_tokens),

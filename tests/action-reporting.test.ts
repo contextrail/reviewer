@@ -1,8 +1,8 @@
 import { prContextSchema } from '../src/pr-context.js';
-import { readHistory, withHistory } from '../action/scripts/history.mjs';
+import { readHistory, withHistory } from '../src/presentation.js';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, existsSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -25,6 +25,12 @@ const pr = { number: 83, base: { ref: 'alpha', sha: base, repo: { full_name: 'ac
 function fixture() {
     const root = mkdtempSync(join(tmpdir(), 'review-action-report-'));
     roots.push(root);
+    mkdirSync(join(root, 'tool/node_modules/@contextrail'), { recursive: true });
+    symlinkSync(
+        fileURLToPath(new URL('..', import.meta.url)),
+        join(root, 'tool/node_modules/@contextrail/code-review-agent'),
+        'dir',
+    );
     const directory = join(root, 'comparison/.contextrail/reviewer/fixture');
     mkdirSync(directory, { recursive: true });
     const write = (name: string, value: unknown) => writeFileSync(join(root, name), JSON.stringify(value));
@@ -39,12 +45,16 @@ function fixture() {
         effort: 'medium',
     };
     const state = {
+        schemaVersion: 2,
+        scopeIdentity: 'sha256:' + 'd'.repeat(64),
+        phases: [],
         runId: 'fixture',
         artifact: { base: { commit: base }, head: { commit: head } },
         reviewer: { nodeId: reviewer, version: 2 },
         reviewStatus: 'incomplete',
         entries: [
             {
+                assessmentId: 'a',
                 nodeId: 'context://engineering/a',
                 version: 1,
                 result: {
@@ -55,6 +65,7 @@ function fixture() {
                 },
             },
             {
+                assessmentId: 'b',
                 nodeId: 'context://engineering/b',
                 version: 1,
                 result: {
@@ -103,6 +114,20 @@ function fixture() {
         write('comparison.json', { pr: 83, base, head, freshness: 'current_at_finish' });
         write('review-status.json', { exit: 1 });
         write('comparison/.contextrail/reviewer/fixture/state.json', state);
+        write('comparison/.contextrail/reviewer/fixture/manifest.json', {
+            contractVersion: 1,
+            runId: state.runId,
+            artifact: state.artifact,
+            scopeIdentity: state.scopeIdentity,
+            entries: state.entries,
+            files: {
+                'state.json':
+                    'sha256:' +
+                    createHash('sha256')
+                        .update(readFileSync(join(directory, 'state.json')))
+                        .digest('hex'),
+            },
+        });
     };
     save();
     const summary = join(root, 'github-summary.md'),
@@ -112,6 +137,11 @@ function fixture() {
     const run = (script: string, responses?: unknown[]) => {
         const args: string[] = [];
         if (responses) {
+            if (script === 'comment')
+                responses = responses.flatMap((raw) => {
+                    const r = raw as { body?: unknown };
+                    return r.body === pr ? [raw, { body: pr }] : [raw];
+                });
             write('responses.json', responses);
             writeFileSync(
                 join(root, 'fetch.mjs'),
@@ -204,7 +234,10 @@ describe('Action health summary', () => {
         expect(md).toContain('Hosted permission settings are unavailable');
         expect(md).toContain('ingestion receipt only');
         expect(md).toContain('[Artifact bundle]');
-        expect(readFileSync(join(f.root, 'summary.md'), 'utf8')).toBe(md);
+        const comment = readFileSync(join(f.root, 'summary.md'), 'utf8');
+        expect(comment).toContain('Assessment coverage');
+        expect(comment).not.toContain('#### Health / performance');
+        expect(comment.indexOf('Governed findings')).toBeLessThan(comment.indexOf('<summary>Run details'));
     });
     it('labels partial and absent cost instead of manufacturing zero, and excludes duplicate wire records', () => {
         const f = fixture();
@@ -300,7 +333,7 @@ describe('opt-in PR comment', () => {
             f.run('comment', [{ body: [] }, { body: pr }, { status: 403, body: { message: 'private upstream error' } }])
                 .status,
         ).toBe(2);
-        expect(f.requests()).toHaveLength(3);
+        expect(f.requests()).toHaveLength(4);
         expect(readFileSync(f.output, 'utf8')).toContain('comment-status=failed');
         expect(f.markdown()).not.toContain('private upstream error');
     });
@@ -310,10 +343,10 @@ describe('opt-in PR comment', () => {
         const result = f.run('comment', [{ body: [] }, { body: pr }, { status: 201, body: { id: 42 } }]);
         expect(result.status).toBe(0);
         const requests = f.requests();
-        expect(requests.map((r) => r.method)).toEqual(['GET', 'GET', 'POST']);
-        expect(requests[2].body.body).toContain(marker);
-        expect(requests[2].body.body).toContain('Update the README');
-        expect(requests[2].body.body).toContain('$0.030000');
+        expect(requests.map((r) => r.method)).toEqual(['GET', 'GET', 'GET', 'POST']);
+        expect(requests[3].body.body).toContain(marker);
+        expect(requests[3].body.body).toContain('Update the README');
+        expect(requests[3].body.body).toContain('$0.030000');
         expect(readFileSync(f.output, 'utf8')).toContain('comment-status=created');
         expect(f.markdown()).toContain('View comment');
     });
@@ -393,7 +426,7 @@ describe('opt-in PR comment', () => {
 describe('retained review history and PR context', () => {
     const stored = (body: string) =>
         JSON.parse(
-            Buffer.from(body.match(/<!-- contextrail-state:v1:([A-Za-z0-9+/=]+) -->/)![1]!, 'base64').toString('utf8'),
+            Buffer.from(body.match(/<!-- contextrail-state:v2:([A-Za-z0-9+/=]+) -->/)![1]!, 'base64').toString('utf8'),
         );
     const discussion = (overrides = {}) => ({
         data: {
@@ -420,7 +453,7 @@ describe('retained review history and PR context', () => {
         const { comment } = seedComment();
         const history = stored(comment.body);
         expect(history).toMatchObject({
-            version: 1,
+            version: 2,
             repository: 'acme/project',
             pr: 83,
             reviewer,
@@ -467,7 +500,7 @@ describe('retained review history and PR context', () => {
         expect(history.assessment.run).toBe('100');
         expect(readHistory(comment.body, { ...f.config, pr: 84 })).toBeNull();
         expect(
-            readHistory(comment.body.replace('contextrail-state:v1:', 'contextrail-state:v2:'), f.config),
+            readHistory(comment.body.replace('contextrail-state:v2:', 'contextrail-state:v3:'), f.config),
         ).toBeNull();
         expect(readHistory('x'.repeat(70000), f.config)).toBeNull();
     });
@@ -584,8 +617,8 @@ describe('retained review history and PR context', () => {
         const history = stored(comment.body);
         history.assessment.head = 'c'.repeat(40);
         comment.body = comment.body.replace(
-            /<!-- contextrail-state:v1:[A-Za-z0-9+/=]+ -->/,
-            `<!-- contextrail-state:v1:${Buffer.from(JSON.stringify(history)).toString('base64')} -->`,
+            /<!-- contextrail-state:v2:[A-Za-z0-9+/=]+ -->/,
+            `<!-- contextrail-state:v2:${Buffer.from(JSON.stringify(history)).toString('base64')} -->`,
         );
         expect(
             f.run('context', [
@@ -600,5 +633,37 @@ describe('retained review history and PR context', () => {
             files: [{ path: 'route.ts', status: 'modified' }],
         });
         expect(context.limitations.join(' ')).toContain('not a linear');
+    });
+});
+
+describe('package-owned Action handoffs', () => {
+    it('passes deterministic PR intent even when optional history collection is disabled', () => {
+        const action = readFileSync(new URL('../action/action.yml', import.meta.url), 'utf8');
+        expect(action).toContain('steps.context.outputs.path || steps.comparison.outputs.pr-context-path');
+        const comparison = readFileSync(new URL('../action/scripts/comparison.mjs', import.meta.url), 'utf8');
+        expect(comparison).toContain("output('pr-context-path', prepared.prContextPath)");
+    });
+    it('retains publication payload and outcome after the original assessment artifact snapshot', () => {
+        const f = fixture();
+        f.write('comparison/.contextrail/reviewer/fixture/publication.json', {
+            status: 'delivery_incomplete',
+            inlineStatus: 'unknown',
+        });
+        f.write('comparison/.contextrail/reviewer/fixture/publication-payloads.json', {
+            review: { event: 'COMMENT', comments: [] },
+        });
+        const env = { ...process.env, REVIEW_ROOT: f.root, GITHUB_OUTPUT: f.output, PUBLICATION_ONLY: 'true' };
+        const result = spawnSync(
+            process.execPath,
+            [fileURLToPath(new URL('../action/scripts/evidence.mjs', import.meta.url))],
+            { encoding: 'utf8', env },
+        );
+        expect(result.status).toBe(0);
+        const retained = JSON.parse(
+            readFileSync(join(f.root, 'publication-evidence/fixture/publication.json'), 'utf8'),
+        );
+        expect(retained).toMatchObject({ status: 'delivery_incomplete', inlineStatus: 'unknown' });
+        expect(existsSync(join(f.root, 'publication-evidence/fixture/publication-payloads.json'))).toBe(true);
+        expect(readFileSync(f.output, 'utf8')).toContain('available=true');
     });
 });

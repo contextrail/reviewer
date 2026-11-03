@@ -1,15 +1,25 @@
+import { PlanCitationError, validatePlan } from '../src/planning.js';
+import { EvidenceLedger } from '../src/evidence.js';
+import { buildInlineReview, validatePublicationArtifacts } from '../src/github.js';
+import type { z } from 'zod';
+import type { assessmentSchema } from '../src/assessment.js';
+import { reconcileFindings, validateAssessments, type AssessmentProposal } from '../src/assessment.js';
+import type { verificationSchema } from '../src/verification.js';
+import { validateVerification } from '../src/verification.js';
 import { loadPrContext, parsePrContext, type PrContext } from '../src/pr-context.js';
-import { McpPublishedReader } from '../src/mcp.js';
 import { sendReviewReport, projectReviewReport } from '../src/feedback.js';
-import type { ReviewReportInput } from '../src/report-contract.js';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, cpSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, existsSync, readFileSync, rmSync, writeFileSync, cpSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { prepareReview, digest } from '../src/prepare.js';
 import { runReview } from '../src/review.js';
+import { loadReviewCheckpoint } from '../src/resume.js';
+import { createPhaseRecord } from '../src/phases.js';
+import { FixedSnapshotSource } from '../src/source.js';
+import { renderActionSummary } from '../src/presentation.js';
 import type { Publication, PublishedReader } from '../src/contracts.js';
 import { providerFailureDiagnostics, type ReviewProvider } from '../src/providers.js';
 
@@ -35,7 +45,8 @@ async function preparedFixture() {
     writeFileSync(prepared.statePath, JSON.stringify(prepared.state));
     return prepared;
 }
-async function createPreparedFixture() {
+async function createPreparedFixture(count = 2) {
+    const contextNames = count === 2 ? ['a', 'b'] : Array.from({ length: count }, (_, i) => `context${i}`);
     const repository = mkdtempSync(join(tmpdir(), 'c3-wire-'));
     const git = (...args: string[]) => execFileSync('git', ['-C', repository, ...args], { encoding: 'utf8' }).trim();
     git('init', '-q');
@@ -64,11 +75,11 @@ async function createPreparedFixture() {
         relationships: [],
         content: {
             kind: 'skill',
-            instructions: 'Review both selected contexts.',
-            reviewer: { selections: { contextIds: ['context://engineering/a', 'context://engineering/b'] } },
+            instructions: 'Review all selected contexts.',
+            reviewer: { selections: { contextIds: contextNames.map((id) => `context://engineering/${id}`) } },
         },
     };
-    const contexts: Publication[] = ['a', 'b'].map((id) => ({
+    const contexts: Publication[] = contextNames.map((id) => ({
         nodeId: `context://engineering/${id}`,
         version: 1,
         title: id,
@@ -105,7 +116,7 @@ async function createPreparedFixture() {
                             ...scope,
                             scopeIdentity: digest(scope),
                             complete: true,
-                            totalMatched: 2,
+                            totalMatched: contexts.length,
                             offset: 0,
                             nextOffset: null,
                         },
@@ -181,7 +192,9 @@ function submissions(prepared: Awaited<ReturnType<typeof preparedFixture>>) {
         { ref: string; text: string; provenance: Record<string, unknown> }
     >;
     const records = Object.values(evidence);
-    const source = records.find((e) => e.provenance.kind === 'source' && e.provenance.path === 'route.ts')!;
+    const source = records.find(
+        (e) => e.provenance.kind === 'source' && e.provenance.path === 'route.ts' && e.provenance.side === 'head',
+    )!;
     return prepared.state.entries.map((entry) => {
         const context = records.find(
             (e) => e.provenance.nodeId === entry.nodeId && e.provenance.path === '/content/body',
@@ -206,108 +219,711 @@ function submissions(prepared: Awaited<ReturnType<typeof preparedFixture>>) {
     });
 }
 
-describe('actual SDK provider wires and source/result tools', () => {
-    it.each(['send', 'off', 'rejected', 'network', 'persistence'] as const)(
-        'C5 reporting %s preserves finalized judgments, exit and local artifact integrity',
-        async (mode) => {
+type AssessmentSubmission = z.infer<typeof assessmentSchema>;
+type VerificationSubmission = z.infer<typeof verificationSchema>;
+type WireSubmission = {
+    entries: Array<ReturnType<typeof planInput>['entries'][number] & VerificationSubmission['entries'][number]>;
+    assessments: AssessmentSubmission['assessments'];
+};
+type WireRequest = {
+    tools: Array<{ function?: { name: string }; name?: string }>;
+    messages: Array<{ role: string; content: string }>;
+    input: unknown;
+};
+type FixturePrepared = Awaited<ReturnType<typeof preparedFixture>>;
+function phaseRequest(body: WireRequest, _prepared: FixturePrepared) {
+    const names = body.tools.map((t) => t.function?.name ?? t.name);
+    const phase = names.includes('submit_plan') ? 'plan' : names.includes('submit_assessments') ? 'assess' : 'verify';
+    const messages =
+        body.messages ?? (body.input as Array<{ role?: string; content: string | Array<{ text?: string }> }>);
+    const user = messages.find((message) => message.role === 'user')!;
+    const text = typeof user.content === 'string' ? user.content : user.content.find((part) => part.text)?.text!;
+    const payload = JSON.parse(text) as {
+        expectedChecklist?: Array<{ assessmentId: string }>;
+        plan?: Array<{ assessmentId: string }>;
+        proposals?: AssessmentProposal[];
+        originalPlan?: unknown;
+        corrections?: unknown;
+    };
+    const ids =
+        phase === 'assess'
+            ? payload.expectedChecklist!.map((entry) => entry.assessmentId)
+            : phase === 'verify'
+              ? payload.proposals!.map((entry) => entry.result.assessmentId)
+              : payload.expectedChecklist!.map((entry) => entry.assessmentId);
+    const unit = 'all',
+        attempt = 1;
+    return { phase, ids, unit, attempt, payload };
+}
+function records(prepared: FixturePrepared) {
+    return Object.values(
+        JSON.parse(readFileSync(join(dirname(prepared.statePath), 'evidence.json'), 'utf8')),
+    ) as Array<{ ref: string; text: string; provenance: Record<string, unknown> }>;
+}
+/** Only mocked provider inputs use selectors; canonical validator fixtures keep exact citations. */
+function modelSelectors(input: unknown, prepared: FixturePrepared): unknown {
+    if (Array.isArray(input)) return input.map((value) => modelSelectors(value, prepared));
+    if (!input || typeof input !== 'object') return input;
+    const value = input as Record<string, unknown>;
+    if (typeof value.ref === 'string' && typeof value.quote === 'string') {
+        const record = records(prepared).find((record) => record.ref === value.ref);
+        if (!record) return { ref: value.ref, startSegment: 1, endSegment: 1 };
+        const segments = record.text.match(/[^\n]*\n|[^\n]+/g) ?? [];
+        const start = typeof value.start === 'number' ? value.start : record.text.indexOf(value.quote);
+        if (start < 0) return { ref: value.ref, startSegment: segments.length + 1, endSegment: segments.length + 1 };
+        let offset = 0;
+        const selected = segments.flatMap((text, index) => {
+            const overlaps = offset < start + value.quote.length && offset + text.length > start;
+            offset += text.length;
+            return overlaps ? [index + 1] : [];
+        });
+        return { ref: value.ref, startSegment: selected[0], endSegment: selected.at(-1) };
+    }
+    return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, modelSelectors(child, prepared)]));
+}
+function planInput(prepared: FixturePrepared, separate = false) {
+    return {
+        entries: prepared.state.entries.map((entry, i) => {
+            const passage = records(prepared).find(
+                (r) => r.provenance.nodeId === entry.nodeId && r.provenance.path === '/content/body',
+            )!;
+            return {
+                assessmentId: entry.assessmentId,
+                applicability: 'applicable',
+                reason: 'Changed disclosure.',
+                workUnit: separate ? `unit${i}` : 'all',
+                checks: [
+                    {
+                        passage: { ref: passage.ref, quote: passage.text },
+                        interpretation: 'Authorize before disclosure.',
+                    },
+                ],
+                surfaces: ['route.ts'],
+                evidenceNeeds: ['Inspect return path.'],
+            };
+        }),
+    };
+}
+function assessmentInput(prepared: FixturePrepared, unit = 'all', attempt = 1, assigned?: string[]) {
+    const revised = join(dirname(prepared.statePath), `phases/plan-${unit}-2.json`);
+    const plan = JSON.parse(
+        readFileSync(
+            attempt > 1 && existsSync(revised) ? revised : join(dirname(prepared.statePath), 'phases/plan.json'),
+            'utf8',
+        ),
+    ).output;
+    return {
+        assessments: submissions(prepared)
+            .filter((r) =>
+                plan.entries.some(
+                    (p: { assessmentId: string; workUnit: string }) =>
+                        p.assessmentId === r.assessmentId &&
+                        (assigned ? assigned.includes(r.assessmentId) : p.workUnit === unit),
+                ),
+            )
+            .map((result) => {
+                const p = plan.entries.find((e: { assessmentId: string }) => e.assessmentId === result.assessmentId);
+                return {
+                    result,
+                    checks: p.checks.map((c: { checkId: string }) => ({
+                        checkId: c.checkId,
+                        disposition: 'evaluated',
+                        sourceRefs: [result.citations[1]],
+                        explanation: 'Direct return without guard.',
+                        contraryEvidence: 'No guard on this path.',
+                        missingEvidence: '',
+                    })),
+                    findings: [
+                        {
+                            classification: 'binding_violation',
+                            checkIds: p.checks.map((c: { checkId: string }) => c.checkId),
+                            locationRefs: [result.citations[1]],
+                            explanation: `Authorization missing, attempt ${attempt}.`,
+                            consequence: 'Unauthorized disclosure.',
+                            correction: 'Authorize actor before return.',
+                            limitations: ['Source inspection only.'],
+                            proposedReplacement:
+                                null as AssessmentSubmission['assessments'][number]['findings'][number]['proposedReplacement'],
+                        },
+                    ],
+                };
+            }),
+    };
+}
+function jointInput(prepared: FixturePrepared, assigned?: string[]) {
+    return {
+        assessments: submissions(prepared)
+            .filter((r) => !assigned || assigned.includes(r.assessmentId))
+            .map((result) => ({
+                result,
+                checks: [
+                    {
+                        passage: result.citations[0],
+                        interpretation: 'Authorize before disclosure.',
+                        disposition: 'evaluated',
+                        sourceRefs: [result.citations[1]],
+                        explanation: 'Direct return without guard.',
+                        contraryEvidence: 'No guard on this path.',
+                        missingEvidence: '',
+                    },
+                ],
+                findings: [
+                    {
+                        classification: 'binding_violation',
+                        checkIndices: [0],
+                        locationRefs: [result.citations[1]],
+                        explanation: 'Authorization missing.',
+                        consequence: 'Unauthorized disclosure.',
+                        correction: 'Authorize actor before return.',
+                        limitations: ['Source inspection only.'],
+                        proposedReplacement: null,
+                    },
+                ],
+            })),
+    };
+}
+function verificationInput(prepared: FixturePrepared, unit = 'all', attempt = 1, supplied?: AssessmentProposal[]) {
+    const proposals =
+        supplied ??
+        JSON.parse(readFileSync(join(dirname(prepared.statePath), `phases/assess-${unit}-${attempt}.json`), 'utf8'))
+            .output;
+    return {
+        entries: proposals.map(
+            (p: {
+                result: { assessmentId: string; citations: unknown[] };
+                findings: Array<{ findingId: string }>;
+            }) => ({
+                assessmentId: p.result.assessmentId,
+                disposition: 'accept',
+                reason: 'Original criterion and direct source confirm the violation.',
+                citations: p.result.citations.map((c: unknown) => {
+                    const v = c as { ref: string; quote: string; start?: number; end?: number };
+                    return {
+                        ref: v.ref,
+                        quote: v.quote,
+                        ...(!supplied || v.start === undefined ? {} : { start: v.start, end: v.end }),
+                    };
+                }),
+                missingChecks: [],
+                findings: p.findings.map((f) => ({
+                    findingId: f.findingId,
+                    accepted: true,
+                    suggestionAccepted: false,
+                    explanation: 'Direct bypass confirmed.',
+                })),
+            }),
+        ),
+    };
+}
+function fixtureWire(
+    prepared: FixturePrepared,
+    provider: ReviewProvider = 'openrouter',
+    opts: {
+        separate?: boolean;
+        units?: string[];
+        mutate?: (phase: string, payload: WireSubmission, n: number) => void;
+        request?: (body: WireRequest) => void | Promise<void>;
+    } = {},
+) {
+    let call = 0;
+    const counts: Record<string, number> = {};
+    return async (_url: unknown, init?: RequestInit) => {
+        const body = JSON.parse(init!.body as string);
+        await opts.request?.(body);
+        const { phase, ids, unit, attempt, payload: requestPayload } = phaseRequest(body, prepared);
+        if (phase === 'assess' && !records(prepared).some((r) => r.provenance.kind === 'source'))
+            return response(provider, [{ name: 'read_source', input: { side: 'head', path: 'route.ts' } }], call++);
+        const n = (counts[phase + unit] = (counts[phase + unit] ?? 0) + 1);
+        const payload =
+            phase === 'plan'
+                ? {
+                      entries: planInput(prepared, opts.separate).entries.filter((entry) =>
+                          ids.includes(entry.assessmentId),
+                      ),
+                  }
+                : phase === 'assess'
+                  ? jointInput(prepared, ids)
+                  : verificationInput(prepared, unit, attempt, requestPayload.proposals);
+        if (phase === 'plan' && opts.units)
+            for (const entry of payload.entries)
+                entry.workUnit =
+                    opts.units[prepared.state.entries.findIndex((e) => e.assessmentId === entry.assessmentId)]!;
+        opts.mutate?.(phase, payload as unknown as WireSubmission, n);
+        const calls =
+            phase === 'assess'
+                ? (payload as AssessmentSubmission).assessments.map((assessment) => ({
+                      name: 'submit_assessments',
+                      input: { assessments: [assessment] },
+                  }))
+                : [{ name: phase === 'plan' ? 'submit_plan' : 'submit_verification', input: payload }];
+        return response(
+            provider,
+            calls.map((call) => ({ ...call, input: modelSelectors(call.input, prepared) })),
+            call++,
+        );
+    };
+}
+const fixtureOptions = (prepared: FixturePrepared) => ({
+    prepared,
+    provider: { provider: 'openrouter' as const, model: 'fixture-model' },
+    logLevel: 'quiet' as const,
+    feedback: 'off' as const,
+});
+
+describe('precise citation correction feedback', () => {
+    it('preserves governing-publication checks and bounded safe correction metadata', async () => {
+        const prepared = await preparedFixture(),
+            entry = prepared.state.entries[0]!,
+            ledger = new EvidenceLedger();
+        const other = ledger.add('Other guidance.', {
+            kind: 'publication',
+            nodeId: 'context://other',
+            version: entry.version,
+            contentHash: entry.contentHash,
+            path: '/content/body',
+        });
+        const selections = [
+            { ref: other.ref, quote: 'Other guidance.' },
+            ...Array.from({ length: 101 }, () => ({ ref: 'private-rejected-ref', quote: 'private-rejected-quote' })),
+        ];
+        const input = {
+            entries: [
+                {
+                    assessmentId: entry.assessmentId,
+                    applicability: 'applicable',
+                    reason: 'Inspect changes.',
+                    workUnit: 'all',
+                    surfaces: [],
+                    evidenceNeeds: [],
+                    checks: selections.map((passage) => ({ passage, interpretation: 'Apply guidance.' })),
+                },
+            ],
+        };
+        let failure: unknown;
+        try {
+            validatePlan(input, [entry], ledger);
+        } catch (error) {
+            failure = error;
+        }
+        expect(failure).toBeInstanceOf(PlanCitationError);
+        const error = failure as PlanCitationError;
+        expect(error.corrections).toHaveLength(100);
+        expect(error.omittedCount).toBe(2);
+        expect(error.corrections[0]).toMatchObject({
+            code: 'wrong_governing_publication',
+            entryIndex: 0,
+            checkIndex: 0,
+        });
+        expect(error.corrections[1]).toMatchObject({
+            code: 'citation_unknown',
+            rejectedRefHash: digest('private-rejected-ref'),
+        });
+        expect(JSON.stringify(error.corrections)).not.toContain('private-rejected');
+    });
+
+    it('preserves different selected occurrences in check and finding identities and merged locations', async () => {
+        const prepared = await preparedFixture(),
+            entry = prepared.state.entries[0]!,
+            ledger = new EvidenceLedger();
+        const governing = ledger.add('Authorize.\nAuthorize.\n', {
+            kind: 'publication',
+            nodeId: entry.nodeId,
+            version: entry.version,
+            contentHash: entry.contentHash,
+            path: '/content/body',
+        });
+        const source = ledger.add(
+            'return secret;\nreturn secret;\n',
+            {
+                kind: 'source',
+                side: 'head',
+                path: 'route.ts',
+            },
+            [
+                { text: 'return secret;\n', line: 1, column: 0 },
+                { text: 'return secret;\n', line: 2, column: 0 },
+            ],
+        );
+        const select = (ref: string, segment: number) => {
+            const { quote, start, end } = ledger.select({ ref, startSegment: segment, endSegment: segment });
+            return { ref, quote, start, end };
+        };
+        const plan = validatePlan(
+            {
+                entries: [
+                    {
+                        assessmentId: entry.assessmentId,
+                        applicability: 'applicable',
+                        reason: 'Two source paths.',
+                        workUnit: 'all',
+                        checks: [1, 2].map((segment) => ({
+                            passage: select(governing.ref, segment),
+                            interpretation: 'Authorize.',
+                        })),
+                        surfaces: ['route.ts'],
+                        evidenceNeeds: [],
+                    },
+                ],
+            },
+            [entry],
+            ledger,
+        );
+        expect(new Set(plan.entries[0]!.checks.map((check) => check.checkId)).size).toBe(2);
+        const result = {
+            assessmentId: entry.assessmentId,
+            revisionOf: null,
+            disposition: 'evaluated',
+            adherence: 0,
+            confidence: 3,
+            confidenceReason: 'Direct source.',
+            finding: 'binding_violation',
+            explanation: 'Missing guard.',
+            consequence: 'Disclosure.',
+            correction: 'Authorize.',
+            limitations: [],
+            citations: [select(governing.ref, 1), select(source.ref, 1)],
+        };
+        const proposal = validateAssessments(
+            {
+                assessments: [
+                    {
+                        result,
+                        checks: plan.entries[0]!.checks.map((check) => ({
+                            checkId: check.checkId,
+                            disposition: 'evaluated',
+                            sourceRefs: [select(source.ref, 1)],
+                            explanation: 'Missing guard.',
+                            contraryEvidence: '',
+                            missingEvidence: '',
+                        })),
+                        findings: [1, 2].map((segment) => ({
+                            classification: 'binding_violation',
+                            checkIds: [plan.entries[0]!.checks[0]!.checkId],
+                            locationRefs: [select(source.ref, segment)],
+                            explanation: 'Missing guard.',
+                            consequence: 'Disclosure.',
+                            correction: 'Authorize.',
+                            limitations: [],
+                            proposedReplacement: null,
+                        })),
+                    },
+                ],
+            },
+            plan.entries,
+            [entry],
+            ledger,
+        )[0]!;
+        expect(new Set(proposal.findings.map((finding) => finding.findingId)).size).toBe(2);
+        expect(proposal.findings.map((finding) => finding.locationRefs[0]!.location?.line)).toEqual([1, 2]);
+        expect(reconcileFindings(proposal.findings)).toHaveLength(2);
+        const merged = reconcileFindings(
+            proposal.findings.map((finding) => ({
+                ...finding,
+                locationRefs: proposal.findings.map((item) => item.locationRefs[0]!),
+            })),
+        );
+        expect(merged).toHaveLength(1);
+        expect(merged[0]!.locationRefs.map((citation) => citation.start)).toEqual([0, 15]);
+    });
+    it('preserves every enclosing index for result, check, finding and verification citations', async () => {
+        const prepared = await preparedFixture();
+        const directory = dirname(prepared.statePath);
+        const ledger = new EvidenceLedger();
+        const material = JSON.parse(readFileSync(prepared.materialPath, 'utf8')) as Record<string, Publication>;
+        for (const publication of Object.values(material)) ledger.publication(publication);
+        ledger.source(await new FixedSnapshotSource(prepared.state.artifact).read({ side: 'head', path: 'route.ts' }));
+        writeFileSync(join(directory, 'evidence.json'), JSON.stringify(ledger.records));
+        const planned = validatePlan(planInput(prepared), prepared.state.entries, ledger);
+        mkdirSync(join(directory, 'phases'), { recursive: true });
+        writeFileSync(join(directory, 'phases/plan.json'), JSON.stringify({ output: planned }));
+        const plan = planned.entries;
+        const input = assessmentInput(prepared);
+        const second = input.assessments[1]!;
+        const secondCheck = { ...structuredClone(plan[1]!.checks[0]!), checkId: 'second-citation-check' };
+        plan[1]!.checks.push(secondCheck);
+        second.checks.push({
+            ...structuredClone(second.checks[0]!),
+            checkId: secondCheck.checkId,
+            sourceRefs: [structuredClone(second.result.citations[1]!), structuredClone(second.result.citations[1]!)],
+        });
+        second.findings.push({
+            ...structuredClone(second.findings[0]!),
+            explanation: 'A second distinct finding for precise field-location validation.',
+            locationRefs: [structuredClone(second.result.citations[1]!), structuredClone(second.result.citations[1]!)],
+        });
+        const failures = [
+            {
+                path: ['assessments', 1, 'result', 'citations', 1],
+                select: (value: typeof input) => value.assessments[1]!.result.citations[1]!,
+            },
+            {
+                path: ['assessments', 1, 'checks', 1, 'sourceRefs', 1],
+                select: (value: typeof input) => value.assessments[1]!.checks[1]!.sourceRefs[1]!,
+            },
+            {
+                path: ['assessments', 1, 'findings', 1, 'locationRefs', 1],
+                select: (value: typeof input) => value.assessments[1]!.findings[1]!.locationRefs[1]!,
+            },
+        ];
+        for (const failure of failures) {
+            const invalid = structuredClone(input);
+            const citation = failure.select(invalid);
+            citation.quote = 'PRIVATE_REJECTED_NESTED_QUOTE';
+            expect(() => validateAssessments(invalid, plan, prepared.state.entries, ledger)).toThrowError(
+                expect.objectContaining({
+                    name: 'CitationError',
+                    code: 'citation_absent',
+                    path: failure.path,
+                    ref: citation.ref,
+                    refHash: digest(citation.ref),
+                }),
+            );
+        }
+        const proposals = validateAssessments(input, plan, prepared.state.entries, ledger);
+        writeFileSync(join(directory, 'phases/assess-all-1.json'), JSON.stringify({ output: proposals }));
+        const verification = verificationInput(prepared);
+        verification.entries.forEach((entry, index) => {
+            entry.findings = proposals[index]!.findings.map((finding) => ({
+                findingId: finding.findingId,
+                accepted: true,
+                suggestionAccepted: false,
+                explanation: 'Fixture finding independently checked.',
+            }));
+        });
+        const citation = verification.entries[1]!.citations[1]!;
+        citation.quote = 'PRIVATE_REJECTED_VERIFICATION_QUOTE';
+        expect(() => validateVerification(verification, proposals, ledger)).toThrowError(
+            expect.objectContaining({
+                name: 'CitationError',
+                code: 'citation_absent',
+                path: ['entries', 1, 'citations', 1],
+                ref: citation.ref,
+                refHash: digest(citation.ref),
+            }),
+        );
+    });
+
+    it.each(['assess', 'verify'] as const)(
+        'returns precise %s correction through the SDK and accepts a repaired evidence range',
+        async (targetPhase) => {
             vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
             const prepared = await preparedFixture();
-            let calls = 0;
-            let submitted: unknown = null;
-            const sender = {
-                async submitReport(report: unknown) {
-                    submitted = report;
-                    // Submission happens after all initial local files and hashes exist.
-                    expect(
-                        JSON.parse(readFileSync(join(dirname(prepared.statePath), 'report.json'), 'utf8')).decision
-                            .exitCode,
-                    ).toBe(1);
-                    expect(readFileSync(join(dirname(prepared.statePath), 'manifest.json'), 'utf8')).toContain(
-                        'report.json',
-                    );
-                    if (mode === 'persistence') {
-                        rmSync(join(dirname(prepared.statePath), 'report.md'));
-                        mkdirSync(join(dirname(prepared.statePath), 'report.md'));
-                    }
-                    if (mode === 'rejected') throw new Error('SENTINEL_RAW_REJECTION_C5');
-                    if (mode === 'network') {
-                        const reader = new McpPublishedReader(
-                            'http://127.0.0.1:1/mcp',
-                            'fixture',
-                            'org',
-                            { status: 'unavailable', reason: 'withheld' },
-                            { timeoutMs: 100 },
-                        );
-                        try {
-                            return await reader.submitReport(report as ReviewReportInput);
-                        } finally {
-                            await reader.close();
-                        }
-                    }
-                    return {
-                        runId: prepared.state.runId,
-                        eventId: `effectiveness://org/review_report_submitted/${prepared.state.runId}`,
-                        receivedAt: '2026-10-01T12:00:00.000Z',
-                        duplicate: false,
-                        rawBody: 'SENTINEL_RAW_RESPONSE_C5',
-                    };
-                },
-            };
+            const expectedPath =
+                targetPhase === 'assess'
+                    ? ['assessments', 0, 'result', 'citations', 1, 'startSegment']
+                    : ['entries', 1, 'citations', 1, 'startSegment'];
+            let correction:
+                | {
+                      message: string;
+                      path: Array<string | number>;
+                      ref: string;
+                      refHash: string;
+                      instruction: string;
+                  }
+                | undefined;
+            let corrected = false;
+            const firstSubmission = 1;
             const result = await runReview({
-                prepared,
-                provider: { provider: 'openrouter', model: 'fixture-model' },
-                feedback: mode === 'off' ? 'off' : 'send',
-                feedbackSender: sender,
-                purpose: 'SENTINEL_LOCAL_PURPOSE_C5',
-                fetch: async () => {
-                    const call = calls++;
-                    const tools =
-                        call === 0
-                            ? [{ name: 'read_source', input: { side: 'head', path: 'route.ts' } }]
-                            : call === 1
-                              ? [
-                                    {
-                                        name: 'submit_results',
-                                        input: {
-                                            results: submissions(prepared).map((r) => ({
-                                                ...r,
-                                                explanation: 'SENTINEL_LOCAL_EXPLANATION_C5',
-                                                limitations: ['SENTINEL_LOCAL_LIMITATIONS_C5'],
-                                            })),
-                                        },
-                                    },
-                                ]
-                              : [{ name: 'finish_review', input: { scope: 'SENTINEL_LOCAL_SCOPE_C5' } }];
-                    return response('openrouter', tools, call);
+                ...fixtureOptions(prepared),
+                fetch: fixtureWire(prepared, 'openrouter', {
+                    request(body) {
+                        for (const message of body.messages) {
+                            if (message.role !== 'tool' || !message.content.trim().startsWith('{')) continue;
+                            const output = JSON.parse(message.content);
+                            if (output.code !== 'citation_range_invalid') continue;
+                            correction = output.correction;
+                            expect(correction).toMatchObject({ path: expectedPath });
+                            expect(correction!.ref).toMatch(/^evidence:[a-f0-9]{64}$/u);
+                            expect(correction!.refHash).toBe(digest(correction!.ref));
+                            expect(correction!.instruction).toContain('startSegment');
+                            expect(JSON.stringify(correction)).not.toContain('PRIVATE_REJECTED_SDK_QUOTE');
+                            expect(output.remainingCorrections).toBe(2);
+                        }
+                    },
+                    mutate(phase, payload, call) {
+                        if (phase !== targetPhase) return;
+                        const assignedId =
+                            targetPhase === 'assess'
+                                ? prepared.state.entries[1]!.assessmentId
+                                : prepared.state.entries[1]!.assessmentId;
+                        if (assignedId !== prepared.state.entries[1]!.assessmentId) return;
+                        if (call === firstSubmission) {
+                            const citation =
+                                targetPhase === 'assess'
+                                    ? payload.assessments[1]!.result.citations[1]!
+                                    : payload.entries[1]!.citations[1]!;
+                            const selection = citation as unknown as Record<string, unknown>;
+                            delete selection.quote;
+                            delete selection.start;
+                            delete selection.end;
+                            selection.startSegment = 1_000_000;
+                            selection.endSegment = 1_000_000;
+                        } else if (call > firstSubmission) {
+                            expect(correction).toBeDefined();
+                            if (targetPhase === 'assess')
+                                payload.assessments = payload.assessments.filter(
+                                    (assessment) =>
+                                        assessment.result.assessmentId === prepared.state.entries[1]!.assessmentId,
+                                );
+                            const citation =
+                                targetPhase === 'assess'
+                                    ? payload.assessments[0]!.result.citations[1]!
+                                    : payload.entries[1]!.citations[1]!;
+                            const evidence = records(prepared).find((record) => record.ref === correction!.ref)!;
+                            citation.ref = correction!.ref;
+                            citation.quote = evidence.text;
+                            corrected = true;
+                        }
+                    },
+                }),
+            });
+            expect(corrected, JSON.stringify(correction)).toBe(true);
+            expect(result.state.verification).toEqual({ expected: 2, verified: 2, complete: true });
+            expect(result.state.execution.calls).toBe(4);
+            expect(readFileSync(join(result.directory, 'diagnostics.jsonl'), 'utf8')).not.toContain(
+                'PRIVATE_REJECTED_SDK_QUOTE',
+            );
+        },
+    );
+});
+
+describe('governed phase execution through actual SDK provider wires', () => {
+    it('rejects legacy quote citations at the strict model tool boundary', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        const prepared = await preparedFixture();
+        const result = await runReview({
+            ...fixtureOptions(prepared),
+            fetch: async () => {
+                const source = new FixedSnapshotSource(prepared.state.artifact);
+                const ledger = new EvidenceLedger();
+                const read = await source.read({ side: 'head', path: 'route.ts' });
+                ledger.source(read);
+                for (const p of Object.values(JSON.parse(readFileSync(prepared.materialPath, 'utf8'))) as Publication[])
+                    ledger.publication(p);
+                writeFileSync(join(dirname(prepared.statePath), 'evidence.json'), JSON.stringify(ledger.records));
+                return response(
+                    'openrouter',
+                    [
+                        {
+                            name: 'submit_assessments',
+                            input: { assessments: jointInput(prepared).assessments.slice(0, 1) },
+                        },
+                    ],
+                    1,
+                );
+            },
+        });
+        expect(result.state.verification.verified).toBe(0);
+        expect(result.state.execution.stopReason).toBe('phase_corrections_exhausted');
+        const events = readFileSync(join(result.directory, 'diagnostics.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line));
+        const rejections = events.filter((event) => event.kind === 'submission_rejected');
+        expect(rejections).toHaveLength(3);
+        expect(rejections.every((event) => event.data.code === 'phase_shape_invalid')).toBe(true);
+        expect(rejections[0].data.details.validation).toContainEqual({
+            code: 'unrecognized_keys',
+            path: ['assessments', 0, 'result', 'citations', 0],
+        });
+    });
+    it('supplies sealed complete metadata and separates inventory navigation from unified patch reading', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-secret-key-never-capture');
+        const prepared = await preparedFixture();
+        const wire = fixtureWire(prepared);
+        const requests: Array<Record<string, unknown>> = [];
+        const result = await runReview({
+            ...fixtureOptions(prepared),
+            fetch: async (url, init) => {
+                const body = JSON.parse(init!.body as string);
+                requests.push(body);
+                if (requests.length === 1)
+                    return response(
+                        'openrouter',
+                        [
+                            { name: 'changes', input: {} },
+                            {
+                                name: 'diff',
+                                input: { offset: prepared.state.changes!.items[0]!.offset, patchLineOffset: 0 },
+                            },
+                        ],
+                        0,
+                    );
+                return wire(url, init);
+            },
+        });
+        expect(result.state.decision?.complete).toBe(true);
+        const first = requests[0] as {
+            messages: Array<{ role: string; content: string }>;
+            tools: Array<{ function: { name: string; parameters: { properties: Record<string, unknown> } } }>;
+        };
+        const payload = JSON.parse(first.messages.find((message) => message.role === 'user')!.content);
+        expect(payload.changedFiles).toEqual(prepared.state.changes);
+        expect(payload.changedFiles.status).toBe('complete');
+        const changesTool = first.tools.find((tool) => tool.function.name === 'changes')!;
+        expect(changesTool.function.parameters.properties).not.toHaveProperty('patchLineOffset');
+        const second = requests[1] as {
+            messages: Array<{ role: string; name?: string; tool_call_id?: string; content: string }>;
+        };
+        const results = second.messages
+            .filter((message) => message.role === 'tool')
+            .map((message) => JSON.parse(message.content));
+        expect(results[0].items[0]).toHaveProperty('offset');
+        expect(results[0].items[0]).not.toHaveProperty('patch');
+        expect(results[1].items[0].patch).toContain('diff --git');
+    });
+    it('does not send a model request when the prepared inventory was changed after sealing', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-secret-key-never-capture');
+        const prepared = await preparedFixture();
+        prepared.state.changes!.items = [];
+        const fetcher = vi.fn();
+        const result = await runReview({ ...fixtureOptions(prepared), fetch: fetcher });
+        expect(fetcher).not.toHaveBeenCalled();
+        expect(result.state.reviewStatus).toBe('incomplete');
+        expect(result.state.decision?.exitCode).toBe(2);
+        expect(readFileSync(join(result.directory, 'diagnostics.jsonl'), 'utf8')).toContain(
+            'preparation_inventory_rejected',
+        );
+    });
+    it.each(['openrouter', 'openai'] as const)(
+        '%s: prepares, assesses and independently verifies with exact phase artifacts',
+        async (provider) => {
+            vi.stubEnv(
+                provider === 'openrouter' ? 'OPENROUTER_API_KEY' : 'OPENAI_API_KEY',
+                'test-secret-key-never-capture',
+            );
+            const prepared = await preparedFixture();
+            const requests: unknown[] = [];
+            const urls: string[] = [];
+            const wire = fixtureWire(prepared, provider, { request: (b) => requests.push(b) });
+            const result = await runReview({
+                ...fixtureOptions(prepared),
+                provider: {
+                    provider,
+                    model: provider === 'openai' ? 'gpt-5-mini' : 'openai/gpt-6-luna',
+                    effort: 'medium',
+                },
+                fetch: async (input, init) => {
+                    urls.push(String(input));
+                    return wire(input, init);
                 },
             });
-            expect(result.state.decision).toMatchObject({ exitCode: 1, reviewExit: 1 });
-            expect(result.state.entries.every((e) => e.result.disposition === 'evaluated')).toBe(true);
-            expect(result.state.execution.reporting.status).toBe(
-                mode === 'off' ? 'off' : mode === 'send' ? 'received' : 'failed',
-            );
-            expect(JSON.stringify(result.state.execution.reporting)).not.toMatch(/SENTINEL/u);
-            if (mode === 'off') expect(submitted).toBeNull();
-            else
-                expect(JSON.stringify(submitted)).not.toMatch(
-                    /SENTINEL|explanation|purpose|path|quote|rawBody|reportPath/u,
-                );
-            expect(JSON.stringify(result.state)).toContain('SENTINEL_LOCAL_EXPLANATION_C5');
-            const state = JSON.parse(readFileSync(result.statePath, 'utf8'));
-            const report = JSON.parse(readFileSync(result.reportPath, 'utf8'));
-            expect(report).toEqual(state);
-            if (mode === 'persistence') {
-                expect(result.state.execution.reporting).toEqual({
-                    status: 'failed',
-                    code: 'local_status_write_failed',
-                });
-                expect(
-                    JSON.parse(readFileSync(join(result.directory, 'reporting-status.json'), 'utf8')).reporting,
-                ).toEqual(result.state.execution.reporting);
-                expect(() => readFileSync(join(result.directory, 'manifest.json'))).toThrow();
-                return;
-            }
-            expect(report.execution.reporting).toEqual(result.state.execution.reporting);
+            expect(result.state.decision).toMatchObject({ exitCode: 1, reviewExit: 1, complete: true });
+            expect(result.state.verification).toEqual({ expected: 2, verified: 2, complete: true });
+            expect(result.state.phases.map((p) => [p.phase, p.workUnitId])).toEqual([
+                ['assess', 'all'],
+                ['verify', 'all'],
+            ]);
+            expect(result.state.findings.every((f) => f.verified)).toBe(true);
+            expect(result.state.checks.every((c) => c.verified)).toBe(true);
+            expect(result.state.execution.calls).toBe(3);
+            expect(result.state.phases.every((p) => p.configuration.adapter === '@ai-sdk/openai')).toBe(true);
+            expect(result.state.execution.providerUsage.every((p) => p.provider === provider)).toBe(true);
+            const diagnostics = readFileSync(join(result.directory, 'diagnostics.jsonl'), 'utf8');
+            expect(diagnostics).toContain('submission_accepted');
+            expect(diagnostics).not.toContain('Enforce authorization');
+            expect(diagnostics).not.toContain('export function');
+            expect(diagnostics).not.toContain('test-secret-key');
             const manifest = JSON.parse(readFileSync(join(result.directory, 'manifest.json'), 'utf8'));
             for (const [name, hash] of Object.entries(manifest.files))
                 expect(hash).toBe(
@@ -315,299 +931,282 @@ describe('actual SDK provider wires and source/result tools', () => {
                         .update(readFileSync(join(result.directory, name)))
                         .digest('hex')}`,
                 );
-            expect(readFileSync(join(result.directory, 'audit.jsonl'), 'utf8')).toContain('review_reporting');
+            if (provider === 'openai') {
+                expect(urls.every((url) => url === 'https://api.openai.com/v1/responses')).toBe(true);
+                expect(requests[0]).toMatchObject({ store: false, reasoning: { effort: 'medium' } });
+            } else {
+                expect(urls.every((url) => url === 'https://openrouter.ai/api/v1/chat/completions')).toBe(true);
+                expect(requests[0]).toMatchObject({
+                    model: 'openai/gpt-6-luna',
+                    reasoning_effort: 'medium',
+                    store: false,
+                });
+                for (const request of requests) {
+                    const tools = (request as { tools: Array<{ function: { name: string; strict: boolean } }> }).tools;
+                    expect(
+                        tools
+                            .filter((t) => t.function.name.startsWith('submit_'))
+                            .every((t) => t.function.strict === true),
+                    ).toBe(true);
+                    expect(
+                        tools
+                            .filter((t) => !t.function.name.startsWith('submit_'))
+                            .every((t) => t.function.strict === false),
+                    ).toBe(true);
+                }
+                expect(result.state.execution.providerUsage[0]).toMatchObject({
+                    provider: 'openrouter',
+                    usage: { cost: 0.001, prompt_tokens: 12, completion_tokens: 8 },
+                });
+                expect(result.state.execution.returnedIdentities[0]).toEqual({
+                    provider: 'reported-upstream',
+                    model: 'returned-model',
+                });
+            }
         },
     );
-    it('C5 projection rejects oversized scope without truncating the local report', async () => {
-        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
-        const prepared = await preparedFixture();
-        const result = await runReview({
-            prepared,
-            provider: { provider: 'openrouter', model: 'fixture-model' },
-            feedback: 'off',
-            limits: { maxTurns: 1 },
-            fetch: async () => response('openrouter', [{ name: 'finish_review', input: { scope: 'fixture' } }], 0),
-        });
-        const local = structuredClone(result.state);
-        local.entries = Array.from({ length: 5001 }, (_, i) => ({
-            ...local.entries[0]!,
-            assessmentId: `entry-${i}`,
-            nodeId: `context://engineering/c${i}`,
-        }));
-        local.expectedContextCount = local.entries.length;
-        expect(await sendReviewReport(local, {})).toEqual({ status: 'failed', code: 'projection_invalid' });
-        expect(local.entries).toHaveLength(5001);
-    });
-    for (const provider of ['openai', 'openrouter'] as const)
-        it(`${provider}: explains an invented search cursor and recovers with a null initial cursor`, async () => {
-            vi.stubEnv(provider === 'openai' ? 'OPENAI_API_KEY' : 'OPENROUTER_API_KEY', 'test-key');
-            const prepared = await preparedFixture();
-            let call = 0;
-            const fetcher: typeof fetch = async () =>
-                response(
-                    provider,
-                    [
-                        {
-                            name: 'search_source',
-                            input: {
-                                side: 'head',
-                                literal: 'authorize',
-                                path: 'policy.ts',
-                                ...(call === 0
-                                    ? { cursor: { scope: 'policy.ts', entryOffset: 0, characterOffset: 0 } }
-                                    : { cursor: null }),
-                            },
-                        },
-                    ],
-                    call++,
-                );
-            const result = await runReview({
-                prepared,
-                provider: { provider, model: 'requested-model' },
-                limits: { maxTurns: 2 },
-                fetch: fetcher,
-            });
-            const events = readFileSync(join(result.directory, 'audit.jsonl'), 'utf8')
-                .trim()
-                .split('\n')
-                .map((line) => JSON.parse(line));
-            const failure = events.find((event) => event.kind === 'tool_error');
-            expect(failure.data).toMatchObject({ name: 'search_source', error: 'invalid_cursor' });
-            expect(failure.data.correction).toContain('Set cursor to null or omit it for the initial search');
-            expect(failure.data.correction).toContain('same side and literal');
-            expect(failure.data.correction).toContain('never a path or repository label');
-            const recovered = events.find(
-                (event) => event.kind === 'tool_response' && event.data.name === 'search_source',
-            );
-            expect(recovered.data.result).toMatchObject({ status: 'complete', evidence: 'literal_navigation_only' });
-            expect(recovered.data.result.items).toEqual(
-                expect.arrayContaining([
-                    expect.objectContaining({ entry: expect.objectContaining({ path: 'policy.ts' }) }),
-                ]),
-            );
-            expect(result.state.execution.stopReason).toBe('max_turns');
-            expect(result.state.decision?.exitCode).toBe(2);
-            expect(result.state.entries.every((entry) => entry.result.disposition === 'not_evaluated')).toBe(true);
-        });
-    for (const provider of ['openai', 'openrouter'] as const)
-        it(`${provider}: tools, per-result rejection, correction, checkpoint and complete audit`, async () => {
-            vi.stubEnv(
-                provider === 'openai' ? 'OPENAI_API_KEY' : 'OPENROUTER_API_KEY',
-                'test-secret-key-never-capture',
-            );
-            const prepared = await preparedFixture();
-            let call = 0;
-            const requests: Array<Record<string, unknown>> = [];
-            const fetcher: typeof fetch = async (url, init) => {
-                expect(String(url)).toBe(
-                    provider === 'openai'
-                        ? 'https://api.openai.com/v1/responses'
-                        : 'https://openrouter.ai/api/v1/chat/completions',
-                );
-                const request = JSON.parse(init!.body as string) as Record<string, unknown>;
-                requests.push(request);
-                expect(request.model).toBe(provider === 'openai' ? 'gpt-5-mini' : 'requested-model');
-                expect(request.tools).toBeTruthy();
-                let calls: Array<{ name: string; input: unknown }>;
-                if (call === 0)
-                    calls = [
-                        { name: 'changes', input: {} },
-                        { name: 'list_source', input: { side: 'head' } },
-                        { name: 'search_source', input: { side: 'head', literal: 'authorize' } },
-                    ];
-                else if (call === 1)
-                    calls = [
-                        { name: 'read_source', input: { side: 'head', path: 'route.ts' } },
-                        { name: 'read_source', input: { side: 'head', path: 'policy.ts' } },
-                    ];
-                else if (call === 2) {
-                    const values = submissions(prepared);
-                    calls = [
-                        {
-                            name: 'submit_results',
-                            input: {
-                                results: [
-                                    values[0],
-                                    { ...values[1], citations: [{ ref: 'unknown', quote: 'invented' }] },
-                                ],
-                            },
-                        },
-                    ];
-                } else if (call === 3) {
-                    const values = submissions(prepared);
-                    calls = [
-                        {
-                            name: 'submit_results',
-                            input: {
-                                results: [
-                                    {
-                                        ...values[0],
-                                        revisionOf: 1,
-                                        explanation:
-                                            'Explicit corrected explanation, same established bypass. test-secret-key-never-capture',
-                                    },
-                                    {
-                                        ...values[1],
-                                        disposition: 'unresolved',
-                                        finding: 'none',
-                                        adherence: null,
-                                        confidence: null,
-                                        explanation: 'Decisive further evidence unavailable.',
-                                    },
-                                ],
-                            },
-                        },
-                    ];
-                } else
-                    calls = [
-                        { name: 'finish_review', input: { scope: 'The changed route and supporting policy only.' } },
-                    ];
-                return response(provider, calls, call++);
-            };
-            const result = await runReview({
-                prepared,
-                provider: {
-                    provider,
-                    model: provider === 'openai' ? 'gpt-5-mini' : 'requested-model',
-                    effort: 'medium',
-                },
-                fetch: fetcher,
-            });
-            expect(result.state.decision).toMatchObject({ exitCode: 1, reviewExit: 1, complete: false });
-            expect(result.state.entries[0]!.result).toMatchObject({ revision: 2, finding: 'binding_violation' });
-            expect(result.state.entries[1]!.result).toMatchObject({
-                disposition: 'unresolved',
-                adherence: null,
-                confidence: null,
-            });
-            expect(result.state.execution.calls).toBe(5);
-            expect(result.state.execution.returnedIdentities[0]).toMatchObject({ model: 'returned-model' });
-            const audit = readFileSync(join(result.directory, 'audit.jsonl'), 'utf8');
-            expect(audit).toContain('result_rejected');
-            expect(audit).toContain('result_accepted');
-            expect(audit).not.toContain('test-secret-key-never-capture');
-            expect(JSON.stringify(result.state)).not.toContain('test-secret-key-never-capture');
-            expect(readFileSync(join(result.directory, 'report.md'), 'utf8')).not.toContain(
-                'test-secret-key-never-capture',
-            );
-            expect(JSON.parse(readFileSync(join(result.directory, 'manifest.json'), 'utf8')).files['report.json']).toBe(
-                `sha256:${createHash('sha256').update(readFileSync(result.reportPath)).digest('hex')}`,
-            );
-            if (provider === 'openai')
-                expect(requests[0]).toMatchObject({ store: false, reasoning: { effort: 'medium' } });
-            else
-                expect(requests[0]).toMatchObject({
-                    reasoning: { effort: 'medium', exclude: true },
-                    usage: { include: true },
-                });
-        });
-    for (const stop of ['provider', 'cancel', 'turns', 'tokens'] as const)
-        it(`preserves accepted blocker when stopped by ${stop}`, async () => {
+    it.each(['send', 'off', 'rejected', 'network'] as const)(
+        'minimal reporting %s preserves judged outcomes and excludes source/explanation',
+        async (mode) => {
             vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
             const prepared = await preparedFixture();
-            const controller = new AbortController();
-            let call = 0;
-            const fetcher: typeof fetch = async () => {
-                if (call === 0)
-                    return response(
-                        'openrouter',
-                        [{ name: 'read_source', input: { side: 'head', path: 'route.ts' } }],
-                        call++,
-                    );
-                if (call === 1)
-                    return response(
-                        'openrouter',
-                        [{ name: 'submit_results', input: { results: [submissions(prepared)[0]] } }],
-                        call++,
-                    );
-                if (stop === 'cancel') {
-                    controller.abort();
-                    throw new DOMException('Aborted', 'AbortError');
-                }
-                return new Response('sensitive provider failure must not appear', { status: 503 });
-            };
+            let report: unknown;
             const result = await runReview({
-                prepared,
-                provider: { provider: 'openrouter', model: 'fixture' },
-                fetch: fetcher,
-                signal: controller.signal,
-                limits: stop === 'turns' ? { maxTurns: 2 } : stop === 'tokens' ? { maxTotalTokens: 40 } : {},
+                ...fixtureOptions(prepared),
+                fetch: fixtureWire(prepared),
+                feedback: mode === 'off' ? 'off' : 'send',
+                feedbackSender: {
+                    async submitReport(value) {
+                        report = value;
+                        expect(readFileSync(join(dirname(prepared.statePath), 'report.json'), 'utf8')).toContain(
+                            'decision',
+                        );
+                        if (mode === 'rejected') throw Error('RAW_SERVER_BODY');
+                        if (mode === 'network') throw new TypeError('network');
+                        return {
+                            runId: prepared.state.runId,
+                            eventId: `effectiveness://org/review_report_submitted/${prepared.state.runId}`,
+                            receivedAt: '2026-10-01T12:00:00.000Z',
+                            duplicate: false,
+                            rawBody: 'RAW_SERVER_BODY',
+                        };
+                    },
+                },
             });
-            expect(result.state.entries[0]!.result).toMatchObject({ finding: 'binding_violation', revision: 1 });
-            expect(result.state.entries[1]!.result.disposition).toBe('not_evaluated');
             expect(result.state.decision?.reviewExit).toBe(1);
-            expect(result.state.decision?.exitCode).toBe(stop === 'provider' || stop === 'cancel' ? 2 : 1);
-            expect(readFileSync(join(result.directory, 'audit.jsonl'), 'utf8')).not.toContain(
-                'sensitive provider failure',
+            expect(result.state.execution.reporting.status).toBe(
+                mode === 'off' ? 'off' : mode === 'send' ? 'received' : 'failed',
             );
-            expect(JSON.parse(readFileSync(result.reportPath, 'utf8')).reviewStatus).toBe('incomplete');
-        });
-    it('reports absent usage explicitly and stops an unenforceable token cutoff', async () => {
+            if (mode === 'off') expect(report).toBeUndefined();
+            else expect(JSON.stringify(report)).not.toMatch(/explanation|quote|route.ts|RAW_SERVER_BODY/);
+            expect(JSON.parse(readFileSync(result.reportPath, 'utf8'))).toEqual(result.state);
+        },
+    );
+    it('checks every clean and nonapplicable judgment rather than only filtering findings', async () => {
         vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
         const prepared = await preparedFixture();
         const result = await runReview({
-            prepared,
-            provider: { provider: 'openrouter', model: 'fixture' },
+            ...fixtureOptions(prepared),
+            fetch: fixtureWire(prepared, 'openrouter', {
+                mutate(phase, payload) {
+                    if (phase === 'assess')
+                        for (const a of payload.assessments) {
+                            a.result.adherence = 2;
+                            a.result.finding = 'none';
+                            a.result.consequence = '';
+                            a.result.correction = '';
+                            a.findings = [];
+                        }
+                    if (phase === 'verify')
+                        for (const e of payload.entries) {
+                            e.disposition = 'unresolved';
+                            e.reason = 'Missing original requirement investigation.';
+                            e.missingChecks = ['Authorization on alternate path.'];
+                        }
+                },
+            }),
+        });
+        expect(result.state.reviewStatus).toBe('incomplete');
+        expect(result.state.verification.verified).toBe(0);
+        expect(result.state.entries.every((e) => e.result.disposition === 'unresolved')).toBe(true);
+        expect(result.state.phases.filter((p) => p.phase === 'verify')).toHaveLength(1);
+    });
+    it.each([
+        ['Key spending limit exceeded', 'provider_credit_limit'],
+        ['Request forbidden', 'provider_permission_denied'],
+    ])('retains a safe HTTP-403 category for %s without provider payload', async (message, code) => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'PRIVATE_PROVIDER_CREDENTIAL');
+        const prepared = await preparedFixture();
+        const result = await runReview({
+            ...fixtureOptions(prepared),
+            fetch: async () =>
+                new Response(
+                    JSON.stringify({
+                        error: {
+                            message,
+                            code: 'PRIVATE_VENDOR_CODE',
+                            metadata: { secret: 'PRIVATE_PROVIDER_CREDENTIAL', source: 'PRIVATE_REPOSITORY_SOURCE' },
+                        },
+                    }),
+                    { status: 403, headers: { 'content-type': 'application/json' } },
+                ),
+        });
+        const diagnostics = readFileSync(join(result.directory, 'diagnostics.jsonl'), 'utf8');
+        const event = diagnostics
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line))
+            .find((e) => e.kind === 'provider_failed');
+        expect(event.data).toMatchObject({ status: 403, code });
+        expect(diagnostics).not.toMatch(
+            /PRIVATE_PROVIDER_CREDENTIAL|PRIVATE_REPOSITORY_SOURCE|PRIVATE_VENDOR_CODE|Key spending limit exceeded|Request forbidden/,
+        );
+        expect(result.state.execution.providerUsage[0]).toMatchObject({
+            provider: 'openrouter',
+            missing: true,
+            usage: null,
+            httpStatus: 403,
+            failureCode: code,
+        });
+        const summary = renderActionSummary(result.state);
+        expect(summary).toContain(`Provider failures: 403 ${code} (1 call)`);
+        expect(summary).not.toMatch(
+            /PRIVATE_PROVIDER_CREDENTIAL|PRIVATE_REPOSITORY_SOURCE|PRIVATE_VENDOR_CODE|Key spending limit exceeded|Request forbidden/,
+        );
+        const grouped = renderActionSummary({
+            ...result.state,
+            execution: {
+                ...result.state.execution,
+                calls: 4,
+                providerUsage: [
+                    ...[1, 2, 3].map((call) => ({ ...result.state.execution.providerUsage[0], call })),
+                    { call: 4, httpStatus: 403, failureCode: 'PRIVATE_UNTRUSTED_CODE' },
+                ],
+            },
+        });
+        expect(grouped).toContain(`Provider failures: 403 ${code} (3 calls)`);
+        expect(grouped).not.toContain('PRIVATE_UNTRUSTED_CODE');
+        expect(result.state.decision?.exitCode).toBe(2);
+    });
+    it('retains usage from an HTTP-200 response rejected by SDK validation while omitting private payload', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        const prepared = await preparedFixture();
+        const result = await runReview({
+            ...fixtureOptions(prepared),
+            fetch: async () => {
+                const b = await response('openrouter', [], 0).json();
+                b.choices[0].message.tool_calls = 'PRIVATE_REASONING';
+                return new Response(JSON.stringify(b), {
+                    headers: { 'content-type': 'application/json', 'x-private': 'PRIVATE_HEADER' },
+                });
+            },
+        });
+        expect(result.state.execution.providerUsage[0]).toMatchObject({
+            call: 1,
+            missing: false,
+            usage: { cost: 0.001 },
+        });
+        const diagnostics = readFileSync(join(result.directory, 'diagnostics.jsonl'), 'utf8');
+        expect(diagnostics).toContain('validation');
+        expect(diagnostics).not.toMatch(/PRIVATE_REASONING|PRIVATE_HEADER/);
+        expect(result.state.decision?.exitCode).toBe(2);
+    });
+    it('stops an unenforceable total-token cutoff and preserves absent usage as null', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        const prepared = await preparedFixture();
+        const result = await runReview({
+            ...fixtureOptions(prepared),
             limits: { maxTotalTokens: 100 },
             fetch: async () => response('openrouter', [{ name: 'changes', input: {} }], 0, false),
         });
         expect(result.state.execution.stopReason).toBe('total_token_limit_unmeasurable');
-        expect(result.state.execution.usage[0]).toMatchObject({
-            inputTokens: null,
-            outputTokens: null,
-            totalTokens: null,
+        expect(result.state.execution.usage[0]).toMatchObject({ totalTokens: null, cost: null });
+    });
+    it('rejects unsupported model/phase options before a provider request', async () => {
+        const prepared = await preparedFixture(),
+            fetch = vi.fn();
+        await expect(
+            runReview({
+                ...fixtureOptions(prepared),
+                phaseModels: { wrong: { provider: 'openrouter', model: 'bad' } } as never,
+                fetch,
+            }),
+        ).rejects.toThrow();
+        expect(fetch).not.toHaveBeenCalled();
+        await expect(runReview({ ...fixtureOptions(prepared), limits: { maxTurns: 1 }, fetch })).rejects.toThrow(
+            'insufficient_phase_call_budget',
+        );
+    });
+    it('does not promote a proposal when its independent verifier fails', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        const prepared = await preparedFixture(),
+            wire = fixtureWire(prepared);
+        const result = await runReview({
+            ...fixtureOptions(prepared),
+            fetch: async (url, init) => {
+                if (String(init?.body).includes('submit_verification'))
+                    return new Response('PRIVATE_PROVIDER_FAILURE', { status: 503 });
+                return wire(url, init);
+            },
+        });
+        expect(result.state.verification.verified).toBe(0);
+        expect(result.state.findings.every((f) => !f.verified)).toBe(true);
+        expect(result.state.decision?.exitCode).toBe(2);
+        expect(readFileSync(join(result.directory, 'diagnostics.jsonl'), 'utf8')).not.toContain(
+            'PRIVATE_PROVIDER_FAILURE',
+        );
+    });
+    it('preserves report failure as execution failure without erasing the underlying verified blocker', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        const prepared = await preparedFixture();
+        mkdirSync(join(dirname(prepared.statePath), 'report.md'));
+        const result = await runReview({ ...fixtureOptions(prepared), fetch: fixtureWire(prepared) });
+        expect(result.state.decision).toMatchObject({ exitCode: 2, reviewExit: 1 });
+        expect(result.state.execution.stopReason).toBe('report_delivery_failed');
+    });
+    it('rejects tampered pinned material before model execution', async () => {
+        const prepared = await preparedFixture(),
+            material = JSON.parse(readFileSync(prepared.materialPath, 'utf8'));
+        material[prepared.state.entries[0]!.assessmentId].content.body = 'changed';
+        writeFileSync(prepared.materialPath, JSON.stringify(material));
+        const fetch = vi.fn();
+        const result = await runReview({ ...fixtureOptions(prepared), fetch });
+        expect(result.state.execution.stopReason).toBe('pinned_material_changed');
+        expect(fetch).not.toHaveBeenCalled();
+    });
+    it('cancels in-flight model work and retains an incomplete report', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        const prepared = await preparedFixture();
+        const result = await runReview({
+            ...fixtureOptions(prepared),
+            limits: { maxTimeMs: 30 },
+            fetch: async (_url, init) =>
+                new Promise((_resolve, reject) => {
+                    const abort = () => reject(new DOMException('Aborted', 'AbortError'));
+                    if (init?.signal?.aborted) abort();
+                    else init?.signal?.addEventListener('abort', abort, { once: true });
+                }),
         });
         expect(result.state.decision?.exitCode).toBe(2);
+        expect(JSON.parse(readFileSync(result.reportPath, 'utf8')).reviewStatus).toBe('incomplete');
+    });
+    it('minimal reporting rejects oversized scope without truncating local assessments', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        const prepared = await preparedFixture();
+        const result = await runReview({ ...fixtureOptions(prepared), fetch: fixtureWire(prepared) });
+        const state = structuredClone(result.state);
+        state.entries = Array.from({ length: 5001 }, (_, i) => ({
+            ...state.entries[0]!,
+            assessmentId: `entry-${i}`,
+            nodeId: `context://engineering/c${i}`,
+        }));
+        state.expectedContextCount = 5001;
+        expect(await sendReviewReport(state, {})).toEqual({ status: 'failed', code: 'projection_invalid' });
+        expect(state.entries).toHaveLength(5001);
     });
 });
 
-describe('additional failure and identity boundaries', () => {
-    it('records safe nested validation diagnostics when an HTTP-200 provider response is malformed', async () => {
-        vi.stubEnv('OPENROUTER_API_KEY', 'test-key-never-capture');
-        const prepared = await preparedFixture();
-        const result = await runReview({
-            prepared,
-            provider: { provider: 'openrouter', model: 'fixture' },
-            feedback: 'off',
-            fetch: async () => {
-                const body = await response('openrouter', [], 0).json();
-                body.choices[0].message.reasoning_details = 'private reasoning must not appear';
-                return new Response(JSON.stringify(body), {
-                    headers: { 'content-type': 'application/json', 'x-private': 'private header must not appear' },
-                });
-            },
-        });
-        expect(result.state.reviewStatus).toBe('incomplete');
-        expect(result.state.decision?.exitCode).toBe(2);
-        const audit = readFileSync(join(result.directory, 'audit.jsonl'), 'utf8');
-        const stopped = audit
-            .trim()
-            .split('\n')
-            .map((line) => JSON.parse(line))
-            .find((event) => event.kind === 'execution_stopped');
-        expect(stopped.data).toMatchObject({
-            status: 200,
-            call: 1,
-            category: 'AI_APICallError',
-            details: {
-                causes: ['AI_APICallError', 'AI_TypeValidationError', 'ZodError'],
-                validation: expect.arrayContaining([
-                    {
-                        code: 'invalid_type',
-                        path: ['choices', 0, 'message', 'reasoning_details'],
-                        expected: 'array',
-                        actual: 'string',
-                    },
-                ]),
-            },
-        });
-        for (const sensitive of [
-            'private reasoning must not appear',
-            'private header must not appear',
-            'test-key-never-capture',
-        ])
-            expect(audit).not.toContain(sensitive);
-    });
+describe('provider diagnostic bounds', () => {
     it('bounds diagnostics and excludes arbitrary messages, field names and values', () => {
         const secret = 'sensitive-value';
         const error = {
@@ -648,6 +1247,9 @@ describe('additional failure and identity boundaries', () => {
         cycle.cause = cycle;
         expect(providerFailureDiagnostics(cycle).causes).toHaveLength(5);
     });
+});
+
+describe('PR context identity and fresh judgment', () => {
     const contextFor = (prepared: Awaited<ReturnType<typeof preparedFixture>>): PrContext => ({
         version: 1,
         repository: 'acme/project',
@@ -710,36 +1312,29 @@ describe('additional failure and identity boundaries', () => {
         },
         limitations: ['Discussion is partial.'],
     });
-    it('passes PR history as untrusted data without carrying prior approvals into current judgments', async () => {
+    it('treats prior approvals and human resolutions as untrusted inputs without skipping current scope', async () => {
         vi.stubEnv('OPENROUTER_API_KEY', 'context-secret-never-send');
-        const prepared = await preparedFixture();
-        const context = contextFor(prepared);
+        const prepared = await preparedFixture(),
+            context = contextFor(prepared);
         context.discussion.items[0]!.body += ' context-secret-never-send';
         const result = await runReview({
-            prepared,
-            provider: { provider: 'openrouter', model: 'fixture' },
+            ...fixtureOptions(prepared),
             prContext: context,
-            feedback: 'off',
-            limits: { maxTurns: 1 },
-            fetch: async (_url, init) => {
-                const request = JSON.parse(String(init?.body));
-                const system = request.messages.find((m: { role: string }) => m.role === 'system').content;
-                expect(system).toContain('untrusted contextual data');
-                expect(system).not.toContain('HISTORY_SAYS_APPROVE');
-                expect(String(init?.body)).toContain('HISTORY_SAYS_APPROVE');
-                expect(String(init?.body)).not.toContain('context-secret-never-send');
-                return response(
-                    'openrouter',
-                    [{ name: 'finish_review', input: { scope: 'Accept prior approval' } }],
-                    0,
-                );
-            },
+            fetch: fixtureWire(prepared, 'openrouter', {
+                request(body) {
+                    const system = body.messages.find(
+                        (m: { role: string }) => m.role === 'system' || m.role === 'developer',
+                    ).content;
+                    expect(system).not.toContain('HISTORY_SAYS_APPROVE');
+                    expect(JSON.stringify(body)).toContain('HISTORY_SAYS_APPROVE');
+                    expect(JSON.stringify(body)).not.toContain('context-secret-never-send');
+                },
+            }),
         });
-        expect(result.state.decision?.exitCode).toBe(2);
-        expect(result.state.decision?.counts.notEvaluated).toBe(2);
+        expect(result.state.verification.verified).toBe(2);
+        expect(result.state.decision?.reviewExit).toBe(1);
         const saved = JSON.parse(readFileSync(join(result.directory, 'pr-context.json'), 'utf8'));
         expect(result.state.execution.prContext?.hash).toBe(digest(saved));
-        expect(saved.discussion.items[0].body).not.toContain('context-secret-never-send');
         expect(JSON.stringify(projectReviewReport(result.state))).not.toContain('HISTORY_SAYS_APPROVE');
     });
     it('rejects wrong comparison/reviewer bindings and oversized context files before model execution', async () => {
@@ -766,134 +1361,494 @@ describe('additional failure and identity boundaries', () => {
         writeFileSync(file, ' '.repeat(200 * 1024 + 1));
         expect(() => loadPrContext(file, prepared.state.artifact, context.reviewer)).toThrow('invalid_pr_context');
     });
+});
 
-    it('rejects duplicates and unknown identities while preserving a valid peer', async () => {
+describe('source tool boundaries and verified suggestions', () => {
+    it('recovers from an invented search cursor without source bodies in diagnostics', async () => {
         vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
-        const prepared = await preparedFixture();
-        let call = 0;
+        const prepared = await preparedFixture(),
+            wire = fixtureWire(prepared);
+        let first = true;
         const result = await runReview({
-            prepared,
-            provider: { provider: 'openrouter', model: 'fixture' },
-            fetch: async () => {
-                if (call === 0)
-                    return response(
-                        'openrouter',
-                        [{ name: 'read_source', input: { side: 'head', path: 'route.ts' } }],
-                        call++,
-                    );
-                const values = submissions(prepared);
-                if (call === 1)
+            ...fixtureOptions(prepared),
+            fetch: async (url, init) => {
+                if (first) {
+                    first = false;
                     return response(
                         'openrouter',
                         [
                             {
-                                name: 'submit_results',
+                                name: 'search_source',
                                 input: {
-                                    results: [
-                                        values[0],
-                                        values[0],
-                                        { ...values[0], assessmentId: 'unknown' },
-                                        values[1],
-                                    ],
+                                    side: 'head',
+                                    path: 'policy.ts',
+                                    literal: 'authorize',
+                                    cursor: { scope: 'policy.ts', entryOffset: 0, characterOffset: 0 },
                                 },
                             },
                         ],
-                        call++,
+                        0,
                     );
-                if (call === 2)
-                    return response(
-                        'openrouter',
-                        [
-                            {
-                                name: 'submit_results',
-                                input: {
-                                    results: [
-                                        {
-                                            ...values[0],
-                                            disposition: 'unresolved',
-                                            adherence: null,
-                                            confidence: null,
-                                            finding: 'none',
-                                        },
-                                    ],
-                                },
-                            },
-                        ],
-                        call++,
-                    );
-                return response('openrouter', [{ name: 'finish_review', input: { scope: 'Fixture only.' } }], call++);
+                }
+                return wire(url, init);
             },
         });
-        expect(result.state.entries[0]!.result).toMatchObject({ disposition: 'unresolved', revision: 1 });
-        expect(result.state.entries[1]!.result).toMatchObject({ disposition: 'evaluated', revision: 1 });
-        expect(result.state.decision).toMatchObject({ reviewExit: 1, counts: { evaluated: 1, unresolved: 1 } });
-        const audit = readFileSync(join(result.directory, 'audit.jsonl'), 'utf8');
-        expect(audit).toContain('Duplicate assessmentId');
-        expect(audit).toContain('Unknown assessmentId');
+        expect(result.state.verification.complete).toBe(true);
+        expect(readFileSync(join(result.directory, 'diagnostics.jsonl'), 'utf8')).toContain('invalid_cursor');
     });
-    it('reports mandatory report failure honestly and retains the underlying blocker', async () => {
+    it('does not expose credential files through read_source', async () => {
         vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
-        const prepared = await preparedFixture();
-        let call = 0;
-        mkdirSync(join(dirname(prepared.statePath), 'report.md'));
+        const prepared = await preparedFixture(),
+            wire = fixtureWire(prepared);
+        let first = true;
         const result = await runReview({
-            prepared,
-            provider: { provider: 'openrouter', model: 'fixture' },
-            fetch: async () => {
-                if (call === 0)
+            ...fixtureOptions(prepared),
+            fetch: async (url, init) => {
+                if (first) {
+                    first = false;
                     return response(
                         'openrouter',
-                        [{ name: 'read_source', input: { side: 'head', path: 'route.ts' } }],
-                        call++,
+                        [{ name: 'read_source', input: { side: 'head', path: '.env.local' } }],
+                        0,
                     );
-                if (call === 1)
-                    return response(
-                        'openrouter',
-                        [{ name: 'submit_results', input: { results: submissions(prepared) } }],
-                        call++,
-                    );
-                return response('openrouter', [{ name: 'finish_review', input: { scope: 'Fixture only.' } }], call++);
+                }
+                return wire(url, init);
             },
         });
-        expect(result.state.decision).toMatchObject({ exitCode: 2, reviewExit: 1 });
-        expect(JSON.parse(readFileSync(result.reportPath, 'utf8')).execution.stopReason).toBe('report_delivery_failed');
-        expect(result.state.entries.every((e) => e.result.disposition === 'evaluated')).toBe(true);
+        expect(result.state.verification.complete).toBe(true);
+        expect(
+            Object.values(JSON.parse(readFileSync(join(result.directory, 'evidence.json'), 'utf8'))).some(
+                (r: { provenance: { path: string } }) => r.provenance.path === '.env.local',
+            ),
+        ).toBe(false);
     });
-    it('rejects tampered pinned material before a provider request', async () => {
-        const prepared = await preparedFixture();
-        const publications = JSON.parse(readFileSync(prepared.materialPath, 'utf8'));
-        publications[prepared.state.entries[0]!.assessmentId].content.body = 'Changed after preparation';
-        writeFileSync(prepared.materialPath, JSON.stringify(publications));
-        const fetcher = vi.fn();
-        const result = await runReview({
-            prepared,
-            provider: { provider: 'openrouter', model: 'fixture' },
-            fetch: fetcher,
-        });
-        expect(result.state.execution.stopReason).toBe('pinned_material_changed');
-        expect(fetcher).not.toHaveBeenCalled();
-        expect(result.state.decision?.exitCode).toBe(2);
-    });
-    it('cancels an in-flight provider at the configured deadline without losing the report', async () => {
+    it('bounds SDK-rejected submission shapes as well as semantic validation retries', async () => {
         vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
         const prepared = await preparedFixture();
         const result = await runReview({
-            prepared,
-            provider: { provider: 'openrouter', model: 'fixture' },
-            limits: { maxTimeMs: 20 },
-            fetch: async (_url, init) =>
-                new Promise<Response>((_resolve, reject) => {
-                    const cancel = () => reject(new DOMException('Aborted', 'AbortError'));
-                    if (init?.signal?.aborted) cancel();
-                    else init?.signal?.addEventListener('abort', cancel, { once: true });
-                }),
+            ...fixtureOptions(prepared),
+            fetch: async () => response('openrouter', [{ name: 'submit_plan', input: { entries: 'invalid' } }], 0),
         });
-        expect(result.state.execution.stopReason).toBe('max_time_ms');
+        expect(result.state.execution.calls).toBe(3);
         expect(result.state.decision?.exitCode).toBe(2);
         expect(
-            JSON.parse(readFileSync(result.reportPath, 'utf8')).entries.every(
-                (e: { result: { disposition: string } }) => e.result.disposition === 'not_evaluated',
+            readFileSync(join(result.directory, 'diagnostics.jsonl'), 'utf8').match(/submission_rejected/g),
+        ).toHaveLength(3);
+    });
+    it('requires a separate independent suggestion acceptance before marking a replacement verified', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        const prepared = await preparedFixture();
+        const result = await runReview({
+            ...fixtureOptions(prepared),
+            fetch: fixtureWire(prepared, 'openrouter', {
+                mutate(phase, payload) {
+                    if (phase === 'assess')
+                        for (const a of payload.assessments) {
+                            const source = records(prepared).find((r) => r.provenance.path === 'route.ts')!;
+                            a.findings[0].proposedReplacement = {
+                                path: 'route.ts',
+                                blob: source.provenance.object,
+                                startLine: 1,
+                                endLine: 1,
+                                before: source.text,
+                                replacement:
+                                    'export function read(actor,document) { authorize(actor); return document; }',
+                            };
+                        }
+                },
+            }),
+        });
+        expect(result.state.findings.every((f) => f.verified)).toBe(true);
+        expect(result.state.findings.every((f) => f.proposedReplacement?.verified === false)).toBe(true);
+    });
+});
+
+describe('deterministic policy classification integrity', () => {
+    it('cannot hide a blocking finding behind a discretionary aggregate', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        const prepared = await preparedFixture();
+        const result = await runReview({
+            ...fixtureOptions(prepared),
+            fetch: fixtureWire(prepared, 'openrouter', {
+                mutate(phase, payload) {
+                    if (phase === 'assess')
+                        for (const a of payload.assessments) {
+                            a.result.finding = 'guidance_departure';
+                            a.result.adherence = 1;
+                        }
+                },
+            }),
+        });
+        expect(result.state.decision?.exitCode).not.toBe(0);
+        expect(result.state.reviewStatus).toBe('incomplete');
+        expect(readFileSync(join(result.directory, 'diagnostics.jsonl'), 'utf8')).toContain('submission_rejected');
+    });
+    it('records actual phase models and mixed provider identity without a fabricated single model', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        vi.stubEnv('OPENAI_API_KEY', 'test-key');
+        const prepared = await preparedFixture(),
+            router = fixtureWire(prepared),
+            openai = fixtureWire(prepared, 'openai');
+        const result = await runReview({
+            ...fixtureOptions(prepared),
+            phaseModels: { verify: { provider: 'openai', model: 'gpt-5-mini' } },
+            fetch: (url, init) => (String(url).includes('api.openai.com') ? openai(url, init) : router(url, init)),
+        });
+        expect(result.state.verification.complete).toBe(true);
+        expect(result.state.execution.providerUsage.filter((u) => u.provider === 'openrouter')).toHaveLength(2);
+        expect(result.state.execution.providerUsage.filter((u) => u.provider === 'openai')).toHaveLength(1);
+        expect(projectReviewReport(result.state).telemetry).toMatchObject({ provider: null, model: null, calls: 3 });
+    });
+});
+
+describe('distinct findings at one governed source location', () => {
+    it('preserves two distinct same-check same-quote issues through independent verification and inline payloads', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        const prepared = await preparedFixture();
+        const result = await runReview({
+            ...fixtureOptions(prepared),
+            fetch: fixtureWire(prepared, 'openrouter', {
+                mutate(phase, payload) {
+                    if (phase === 'assess')
+                        for (const assessment of payload.assessments) {
+                            const first = assessment.findings[0]!;
+                            assessment.findings.push({
+                                ...structuredClone(first),
+                                explanation: 'A second distinct governed issue on the same expression.',
+                                consequence: 'A different supported consequence.',
+                                correction: 'A different necessary correction.',
+                            });
+                        }
+                },
+            }),
+        });
+        expect(result.state.verification.complete).toBe(true);
+        expect(result.state.findings).toHaveLength(2);
+        expect(new Set(result.state.findings.map((f) => f.findingId)).size).toBe(2);
+        expect(result.state.findings.every((f) => f.verified)).toBe(true);
+        const git = (...args: string[]) =>
+            execFileSync('git', ['-C', prepared.state.artifact.repository, ...args], { encoding: 'utf8' });
+        const evidence = JSON.parse(readFileSync(join(result.directory, 'evidence.json'), 'utf8'));
+        const inline = buildInlineReview(result.state, evidence, {
+            diff: git(
+                'diff',
+                '--no-ext-diff',
+                '--no-textconv',
+                prepared.state.artifact.base.commit,
+                prepared.state.artifact.head.commit,
             ),
-        ).toBe(true);
+            source: (side, path) => {
+                const commit = prepared.state.artifact[side].commit;
+                return { blob: git('rev-parse', `${commit}:${path}`).trim(), text: git('show', `${commit}:${path}`) };
+            },
+        });
+        expect(inline.comments).toHaveLength(1);
+        expect(inline.comments[0]!.line).toBe(1);
+        expect(inline.comments[0]!.body).toContain('Authorization missing');
+        expect(inline.comments[0]!.body).toContain('A second distinct governed issue');
+        expect(result.state.findings).toHaveLength(2);
+    });
+});
+
+describe('self-contained verification contract correction', () => {
+    it.each(['assessment_acceptance', 'suggestion_acceptance'] as const)(
+        'explains and recovers from %s confusion without a new model or semantic repair cycle',
+        async (kind) => {
+            vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+            const prepared = await preparedFixture();
+            let correctionSeen = false;
+            const result = await runReview({
+                ...fixtureOptions(prepared),
+                fetch: fixtureWire(prepared, 'openrouter', {
+                    request(body) {
+                        if (
+                            JSON.stringify(body).includes(
+                                kind === 'assessment_acceptance'
+                                    ? 'Accept means the assessment is supported'
+                                    : 'Set suggestionAccepted=false unless',
+                            )
+                        )
+                            correctionSeen = true;
+                    },
+                    mutate(phase, payload, n) {
+                        if (phase === 'verify' && n === 1)
+                            for (const entry of payload.entries) {
+                                if (kind === 'assessment_acceptance') entry.findings[0]!.accepted = false;
+                                else entry.findings[0]!.suggestionAccepted = true;
+                            }
+                    },
+                }),
+            });
+            expect(correctionSeen).toBe(true);
+            expect(result.state.verification.complete).toBe(true);
+            expect(result.state.decision?.reviewExit).toBe(1);
+            expect(result.state.phases.filter((p) => p.phase === 'verify')).toHaveLength(1);
+            expect(result.state.findings.every((f) => f.verified)).toBe(true);
+        },
+    );
+});
+
+function stoppedResponse() {
+    return new Response(
+        JSON.stringify({
+            id: 'stopped',
+            object: 'chat.completion',
+            created: 1,
+            model: 'fixture-model',
+            choices: [
+                {
+                    index: 0,
+                    message: { role: 'assistant', content: 'Finished my current response.' },
+                    finish_reason: 'stop',
+                },
+            ],
+            usage: { prompt_tokens: 12, completion_tokens: 8, total_tokens: 20, cost: 0.001 },
+        }),
+        { headers: { 'content-type': 'application/json' } },
+    );
+}
+describe('one coherent investigation and one independent check', () => {
+    it('accounts for all twenty original criteria in one joint investigation, then verifies the full set once', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        const prepared = await createPreparedFixture(20),
+            requests: Array<ReturnType<typeof phaseRequest>> = [];
+        const result = await runReview({
+            ...fixtureOptions(prepared),
+            maxParallel: 20,
+            fetch: fixtureWire(prepared, 'openrouter', {
+                request(body) {
+                    requests.push(phaseRequest(body, prepared));
+                },
+            }),
+        });
+        expect(result.state.verification).toEqual({ expected: 20, verified: 20, complete: true });
+        expect(result.state.phases.map((p) => [p.phase, p.workUnitId, p.assessmentIds.length])).toEqual([
+            ['assess', 'all', 20],
+            ['verify', 'all', 20],
+        ]);
+        expect(requests.every((r) => r.ids.length === 20)).toBe(true);
+        expect(requests.filter((r) => r.phase === 'verify')).toHaveLength(1);
+        expect(result.state.execution.calls).toBe(3);
+    });
+    it('continues after an early stop with only missing IDs and never rewrites accepted judgments', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        const prepared = await preparedFixture();
+        let first = true,
+            stopped = false,
+            sawRemaining = false;
+        const wire = fixtureWire(prepared, 'openrouter', {
+            request(body) {
+                sawRemaining ||= body.messages.some(
+                    (m) =>
+                        m.role === 'user' &&
+                        m.content.includes('Continue the same investigation') &&
+                        m.content.includes(prepared.state.entries[1]!.assessmentId),
+                );
+            },
+            mutate(phase, payload, n) {
+                if (phase === 'assess' && n === 1) payload.assessments = payload.assessments.slice(0, 1);
+                if (phase === 'assess' && n > 1) payload.assessments[0]!.result.explanation = 'Attempted overwrite';
+            },
+        });
+        const result = await runReview({
+            ...fixtureOptions(prepared),
+            fetch: async (url, init) => {
+                const body = JSON.parse(String(init?.body));
+                const request = phaseRequest(body, prepared);
+                if (request.phase === 'assess' && records(prepared).some((r) => r.provenance.kind === 'source')) {
+                    if (first) first = false;
+                    else if (!stopped) {
+                        stopped = true;
+                        return stoppedResponse();
+                    }
+                }
+                return wire(url, init);
+            },
+        });
+        expect(sawRemaining).toBe(true);
+        expect(result.state.verification.verified).toBe(2);
+        expect(result.state.entries[0]!.result).toMatchObject({
+            explanation: 'The changed route discloses without a guard.',
+        });
+        expect(result.state.phases.map((p) => p.phase)).toEqual(['assess', 'verify']);
+    });
+    it('bounds repeated early stops and retains auditable partial progress without accepting it', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        const prepared = await preparedFixture();
+        let stopped = 0;
+        const result = await runReview({
+            ...fixtureOptions(prepared),
+            fetch: async () => {
+                stopped++;
+                return stoppedResponse();
+            },
+        });
+        expect(stopped).toBe(3);
+        expect(result.state.execution.calls).toBe(3);
+        expect(result.state.execution.stopReason).toBe('model_stopped');
+        expect(result.state.verification.verified).toBe(0);
+        expect(result.state.phases.map((p) => p.phase)).toEqual(['assess']);
+    });
+    it('does not semantically rerun a rejected assessment or invoke a second verifier', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        const prepared = await preparedFixture();
+        const result = await runReview({
+            ...fixtureOptions(prepared),
+            fetch: fixtureWire(prepared, 'openrouter', {
+                mutate(phase, payload) {
+                    if (phase === 'verify')
+                        for (const entry of payload.entries) {
+                            entry.disposition = 'revise';
+                            entry.findings.forEach((f) => {
+                                f.accepted = false;
+                            });
+                            entry.missingChecks = ['Decisive source evidence missing.'];
+                        }
+                },
+            }),
+        });
+        expect(result.state.phases.map((p) => p.phase)).toEqual(['assess', 'verify']);
+        expect(result.state.verification.verified).toBe(0);
+        expect(result.state.findings.every((f) => !f.verified)).toBe(true);
+        expect(result.state.decision?.exitCode).toBe(2);
+    });
+    it('resumes a sealed failed verifier without repeating the complete investigation and rejects mutated checkpoints', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        const prepared = await createPreparedFixture();
+        const wire = fixtureWire(prepared);
+        const failed = await runReview({
+            ...fixtureOptions(prepared),
+            fetch: (url, init) =>
+                phaseRequest(JSON.parse(String(init?.body)), prepared).phase === 'verify'
+                    ? Promise.resolve(new Response('{}', { status: 503 }))
+                    : wire(url, init),
+        });
+        const loaded = loadReviewCheckpoint(failed.directory, {
+            artifact: prepared.state.artifact,
+            reviewerId: prepared.state.requestedReviewerId,
+        });
+        const changed = structuredClone(loaded.checkpoint);
+        changed.state.execution.purpose = 'mutated';
+        await expect(runReview({ ...fixtureOptions(loaded.prepared), resume: changed, fetch: wire })).rejects.toThrow(
+            'resume_checkpoint_changed',
+        );
+        const seen: string[] = [];
+        const resumed = await runReview({
+            ...fixtureOptions(loaded.prepared),
+            resume: loaded.checkpoint,
+            fetch: fixtureWire(prepared, 'openrouter', {
+                request(body) {
+                    seen.push(phaseRequest(body, prepared).phase);
+                },
+            }),
+        });
+        expect(seen).toEqual(['verify']);
+        expect(resumed.state.verification.verified).toBe(2);
+        expect(resumed.state.reviewStatus).toBe('complete');
+        expect(resumed.state.execution.stopReason).toBe('finished');
+        expect(resumed.state.execution.calls).toBe(failed.state.execution.calls + 1);
+        expect(resumed.state.phases.filter((p) => p.phase === 'assess')).toHaveLength(1);
+        expect(resumed.state.phases.filter((p) => p.phase === 'verify').map((p) => p.attempt)).toEqual([1, 2]);
+        expect(() => validatePublicationArtifacts(resumed.directory, resumed.state, resumed.statePath)).not.toThrow();
+    });
+    it('does not resurrect an older complete assessment superseded by a failed reassessment', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        const prepared = await createPreparedFixture();
+        const wire = fixtureWire(prepared);
+        const first = await runReview({
+            ...fixtureOptions(prepared),
+            fetch: (url, init) =>
+                phaseRequest(JSON.parse(String(init?.body)), prepared).phase === 'verify'
+                    ? Promise.resolve(new Response('{}', { status: 503 }))
+                    : wire(url, init),
+        });
+        const original = first.state.phases.find((p) => p.phase === 'assess')!;
+        const failed = createPhaseRecord({
+            ...original,
+            attempt: 2,
+            status: 'failed',
+            output: null,
+            stopReason: 'model_stopped',
+        });
+        first.state.phases.push(failed);
+        writeFileSync(first.statePath, JSON.stringify(first.state));
+        const name = 'phases/assess-all-2.json';
+        writeFileSync(join(first.directory, name), JSON.stringify(failed));
+        const manifest = JSON.parse(readFileSync(join(first.directory, 'manifest.json'), 'utf8'));
+        for (const file of [...Object.keys(manifest.files), name])
+            manifest.files[file] =
+                'sha256:' +
+                createHash('sha256')
+                    .update(readFileSync(join(first.directory, file)))
+                    .digest('hex');
+        writeFileSync(join(first.directory, 'manifest.json'), JSON.stringify(manifest));
+        const loaded = loadReviewCheckpoint(first.directory, {
+            artifact: prepared.state.artifact,
+            reviewerId: prepared.state.requestedReviewerId,
+        });
+        const phases: string[] = [];
+        const result = await runReview({
+            ...fixtureOptions(loaded.prepared),
+            resume: loaded.checkpoint,
+            fetch: fixtureWire(prepared, 'openrouter', {
+                request(body) {
+                    phases.push(phaseRequest(body, prepared).phase);
+                },
+            }),
+        });
+        expect(phases).toEqual(['assess', 'verify']);
+        expect(result.state.phases.filter((p) => p.phase === 'assess').map((p) => p.attempt)).toEqual([1, 2, 3]);
+        expect(result.state.verification.verified).toBe(2);
+        expect(() => validatePublicationArtifacts(result.directory, result.state, result.statePath)).not.toThrow();
+    });
+    it('resumes only unfinished criterion judgments from a sealed partial investigation', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        const prepared = await createPreparedFixture();
+        let submitted = false;
+        const wire = fixtureWire(prepared, 'openrouter', {
+            mutate(phase, payload) {
+                if (phase === 'assess') {
+                    payload.assessments = payload.assessments.slice(0, 1);
+                    submitted = true;
+                }
+            },
+        });
+        const first = await runReview({
+            ...fixtureOptions(prepared),
+            fetch: (url, init) => (submitted ? Promise.resolve(stoppedResponse()) : wire(url, init)),
+        });
+        const loaded = loadReviewCheckpoint(first.directory, {
+            artifact: prepared.state.artifact,
+            reviewerId: prepared.state.requestedReviewerId,
+        });
+        let sawPending = false;
+        const resumed = await runReview({
+            ...fixtureOptions(loaded.prepared),
+            resume: loaded.checkpoint,
+            fetch: fixtureWire(prepared, 'openrouter', {
+                request(body) {
+                    const request = phaseRequest(body, prepared);
+                    if (request.phase === 'assess') {
+                        const payload = request.payload as unknown as {
+                            remaining: string[];
+                            retained: AssessmentProposal[];
+                        };
+                        expect(payload.remaining).toEqual([prepared.state.entries[1]!.assessmentId]);
+                        expect(payload.retained).toHaveLength(1);
+                        sawPending = true;
+                    }
+                },
+                mutate(phase, payload) {
+                    if (phase === 'assess')
+                        payload.assessments = payload.assessments.filter(
+                            (p) => p.result.assessmentId === prepared.state.entries[1]!.assessmentId,
+                        );
+                },
+            }),
+        });
+        expect(sawPending).toBe(true);
+        expect(resumed.state.verification.verified).toBe(2);
+        expect(resumed.state.reviewStatus).toBe('complete');
+        expect(() => validatePublicationArtifacts(resumed.directory, resumed.state, resumed.statePath)).not.toThrow();
     });
 });

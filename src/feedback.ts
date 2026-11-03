@@ -24,6 +24,9 @@ export interface ReviewFeedbackSender {
 export function projectReviewReport(state: ReviewState, repositoryAttribution = false): ReviewReportInput {
     if (!state.reviewer || !state.decision || state.reviewStatus === 'running') throw new Error('review_not_finalized');
     const e = state.execution;
+    const phaseProviders = Object.values(e.phaseModels ?? { shared: e.requested });
+    const providers = new Set(phaseProviders.map((profile) => profile.provider));
+    const models = new Set(phaseProviders.map((profile) => profile.model));
     const stop: Record<string, ReviewReportInput['stopReason']> = {
         finished: 'finished',
         preparation_incomplete: 'preparation_incomplete',
@@ -46,7 +49,7 @@ export function projectReviewReport(state: ReviewState, repositoryAttribution = 
         runId: state.runId,
         origin: 'npm',
         packageVersion,
-        methodVersion: 'context-review-v1',
+        methodVersion: 'context-review-v2',
         reviewer: { nodeId: state.reviewer.nodeId, version: state.reviewer.version },
         repository: repositoryAttribution
             ? repository.status === 'reported'
@@ -84,13 +87,14 @@ export function projectReviewReport(state: ReviewState, repositoryAttribution = 
         stopReason: stop[e.stopReason ?? ''] ?? 'execution_error',
         telemetry: {
             durationMs: e.elapsedMs,
-            provider: e.requested.provider,
-            model: e.requested.model,
+            provider: providers.size === 1 ? phaseProviders[0]!.provider : null,
+            model: providers.size === 1 && models.size === 1 ? phaseProviders[0]!.model : null,
             harness: 'v2-review-agent',
             returned: e.returnedIdentities.map((id) => ({ provider: id.provider, model: id.model })),
             calls: e.calls,
             usage: Array.from({ length: e.calls }, (_, i) => {
-                const u = reportedUsage(e.requested.provider, e.providerUsage.find((u) => u.call === i + 1)?.usage);
+                const call = e.providerUsage.find((u) => u.call === i + 1);
+                const u = reportedUsage(call?.provider ?? e.requested.provider, call?.usage);
                 return {
                     call: i + 1,
                     inputTokens: u.inputTokens,

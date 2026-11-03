@@ -1,6 +1,7 @@
-## 1.0.0-alpha.5 (2026-11-02)
+## 1.0.0-alpha.6 (2026-11-03)
 
 ### Features
 
-* **reviewer:** add stateful PR comments and operational summaries 5c218c3
+* **reviewer:** add governed review workflow c61344a
+* **reviewer:** add governed review workflow 7714d15
 

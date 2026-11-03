@@ -1,0 +1,116 @@
+[
+    {
+        "id": "A1",
+        "pair": "A",
+        "contextId": "context://fixture/document-access",
+        "title": "Document access",
+        "rule": "A document read must reject an actor whose tenantId differs from the document's tenantId before returning that document. A read by an actor in the same tenant is permitted. Use the actor and document supplied to the changed operation; an upstream check must not be assumed when none is shown.",
+        "before": {
+            "route.js": "module.exports.readDocument = function (actor, document) {\n  if (actor.tenantId !== document.tenantId) throw new Error('forbidden');\n  return document;\n};\n"
+        },
+        "after": {
+            "route.js": "module.exports.readDocument = function (actor, document) {\n  return document;\n};\n"
+        },
+        "expected": {
+            "finding": "binding_violation",
+            "issue": "Cross-tenant callers receive the document because the changed read removes its tenant check.",
+            "location": "route.js"
+        }
+    },
+    {
+        "id": "A2",
+        "pair": "A",
+        "contextId": "context://fixture/document-access",
+        "title": "Document access",
+        "rule": "A document read must reject an actor whose tenantId differs from the document's tenantId before returning that document. A read by an actor in the same tenant is permitted. Use the actor and document supplied to the changed operation; an upstream check must not be assumed when none is shown.",
+        "before": {
+            "route.js": "module.exports.readDocument = function (actor, document) {\n  return document;\n};\n"
+        },
+        "after": {
+            "route.js": "module.exports.readDocument = function (actor, document) {\n  if (actor.tenantId !== document.tenantId) throw new Error('forbidden');\n  return document;\n};\n"
+        },
+        "expected": {
+            "finding": "none",
+            "issue": "The changed read rejects cross-tenant access and permits a same-tenant caller.",
+            "location": "route.js"
+        }
+    },
+    {
+        "id": "B1",
+        "pair": "B",
+        "contextId": "context://fixture/response-contract",
+        "title": "Response contract",
+        "rule": "The changed readCount operation must return the response shape and value types declared in api-contract.json. The published response field count is required and must be an integer. Compare the actual handler return value with that contract; a renamed implementation variable is allowed when it preserves the response contract.",
+        "before": {
+            "route.js": "module.exports.readCount = function (items) {\n  const count = items.length;\n  if (!Number.isSafeInteger(count)) throw new Error('invalid count');\n  return { count: count };\n};\n",
+            "api-contract.json": "{\"operation\":\"readCount\",\"response\":{\"count\":\"integer\"}}\n"
+        },
+        "after": {
+            "route.js": "module.exports.readCount = function (items) {\n  const count = items.length;\n  if (!Number.isSafeInteger(count)) throw new Error('invalid count');\n  return { count: String(count) };\n};\n",
+            "api-contract.json": "{\"operation\":\"readCount\",\"response\":{\"count\":\"integer\"}}\n"
+        },
+        "expected": {
+            "finding": "binding_violation",
+            "issue": "The changed handler serializes count as a string despite the unchanged integer response contract.",
+            "location": "route.js"
+        },
+        "fixtureVersion": 2
+    },
+    {
+        "id": "B2",
+        "pair": "B",
+        "contextId": "context://fixture/response-contract",
+        "title": "Response contract",
+        "rule": "The changed readCount operation must return the response shape and value types declared in api-contract.json. The published response field count is required and must be an integer. Compare the actual handler return value with that contract; a renamed implementation variable is allowed when it preserves the response contract.",
+        "before": {
+            "route.js": "module.exports.readCount = function (items) {\n  const count = items.length;\n  if (!Number.isSafeInteger(count)) throw new Error('invalid count');\n  return { count: count };\n};\n",
+            "api-contract.json": "{\"operation\":\"readCount\",\"response\":{\"count\":\"integer\"}}\n"
+        },
+        "after": {
+            "route.js": "module.exports.readCount = function (items) {\n  const total = items.length;\n  if (!Number.isSafeInteger(total)) throw new Error('invalid count');\n  return { count: total };\n};\n",
+            "api-contract.json": "{\"operation\":\"readCount\",\"response\":{\"count\":\"integer\"}}\n"
+        },
+        "expected": {
+            "finding": "none",
+            "issue": "The implementation variable changes, but the required integer response field remains consistent.",
+            "location": "route.js"
+        },
+        "fixtureVersion": 2
+    },
+    {
+        "id": "C1",
+        "pair": "C",
+        "contextId": "context://fixture/save-completion",
+        "title": "Save completion",
+        "rule": "The save operation may report saved only after its supplied write promise succeeds, and must propagate a write rejection to its caller. Awaiting the promise or returning a promise chain are both permitted. Do not require the async/await syntax when another implementation has the same completion and rejection behavior.",
+        "before": {
+            "route.js": "module.exports.save = async function (write) {\n  await write();\n  return 'saved';\n};\n"
+        },
+        "after": {
+            "route.js": "module.exports.save = function (write) {\n  const pending = write();\n  pending.catch(function () {});\n  return Promise.resolve('saved');\n};\n"
+        },
+        "expected": {
+            "finding": "binding_violation",
+            "issue": "The changed operation reports saved before persistence succeeds and swallows write rejection.",
+            "location": "route.js"
+        }
+    },
+    {
+        "id": "C2",
+        "pair": "C",
+        "contextId": "context://fixture/save-completion",
+        "title": "Save completion",
+        "rule": "The save operation may report saved only after its supplied write promise succeeds, and must propagate a write rejection to its caller. Awaiting the promise or returning a promise chain are both permitted. Do not require the async/await syntax when another implementation has the same completion and rejection behavior.",
+        "before": {
+            "route.js": "module.exports.save = async function (write) {\n  await write();\n  return 'saved';\n};\n"
+        },
+        "after": {
+            "route.js": "module.exports.save = function (write) {\n  return write().then(function () { return 'saved'; });\n};\n"
+        },
+        "expected": {
+            "finding": "none",
+            "issue": "Returning the promise chain preserves success timing and rejection propagation, a permitted alternative.",
+            "location": "route.js"
+        }
+    }
+]

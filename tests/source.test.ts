@@ -6,6 +6,7 @@ import { afterAll, afterEach, describe, expect, it } from 'vitest';
 import { createSourceFixture, demonstrateSource } from '../scripts/source-demo.mjs';
 import * as api from '../src/index.js';
 import { digest } from '../src/prepare.js';
+import { MAX_PREPARATION_BYTES, passiveGitEnvironment } from '../src/git.js';
 
 let seed: ReturnType<typeof createSourceFixture> | undefined;
 const directories: string[] = [];
@@ -35,8 +36,161 @@ afterAll(() => {
     seed?.cleanup();
 });
 const content = (result: api.ReadResult) => result.fragments.map((fragment) => fragment.text).join('');
+function normalPatch(f: ReturnType<typeof fixture>, paths: string[]) {
+    return execFileSync(
+        'git',
+        [
+            '--literal-pathspecs',
+            '-c',
+            'core.fsmonitor=false',
+            '-C',
+            f.root,
+            'diff',
+            '--no-ext-diff',
+            '--no-textconv',
+            '--no-color',
+            '--no-relative',
+            '--diff-algorithm=myers',
+            '--find-renames=50%',
+            '-O/dev/null',
+            '--src-prefix=a/',
+            '--dst-prefix=b/',
+            f.base,
+            f.head,
+            '--',
+            ...paths,
+        ],
+        { encoding: 'utf8', env: passiveGitEnvironment(), stdio: ['ignore', 'pipe', 'ignore'] },
+    );
+}
 
 describe('passive fixed-snapshot source operations', () => {
+    it('leaves an oversized inventory explicitly incomplete instead of accepting a complete prefix', async () => {
+        const f = fixture();
+        const source = new api.FixedSnapshotSource(api.fixGitIdentity(f.root, f.base, f.head));
+        const page = await source.changes();
+        const item = page.items.find((entry) => entry.head)!;
+        source.changes = async () => ({
+            ...page,
+            items: [
+                { ...item, offset: 0, base: null, head: { ...item.head!, path: 'x'.repeat(MAX_PREPARATION_BYTES) } },
+            ],
+            status: 'complete',
+            next: null,
+        });
+        const inventory = await source.changeInventory();
+        expect(inventory).toMatchObject({
+            status: 'truncated',
+            reason: 'inventory_output_limit',
+            items: [],
+            next: { offset: 0 },
+        });
+        expect(Buffer.byteLength(JSON.stringify(inventory))).toBeLessThan(MAX_PREPARATION_BYTES);
+    });
+    it('prepares every permitted file beyond patch and metadata pages with direct global offsets', async () => {
+        const f = fixture();
+        for (let index = 0; index < 105; index++)
+            f.write(`bulk/${String(index).padStart(3, '0')}.ts`, `export const n = ${index};\n`);
+        f.write('zz/Editor.tsx', 'export const Editor = () => <button>Save</button>;\n');
+        f.write('.env.local', 'SECRET=not-for-review\n');
+        f.git('add', '-f', '--', 'bulk', 'zz', '.env.local');
+        f.git('-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgSign=false', 'commit', '-m', 'synthetic inventory');
+        const source = new api.FixedSnapshotSource(api.fixGitIdentity(f.root, f.base, 'HEAD'), { readLines: 8 });
+        const firstPatch = await source.diff();
+        expect(firstPatch.status).toBe('truncated');
+        expect(firstPatch.items.some((item) => item.change.head?.path === 'zz/Editor.tsx')).toBe(false);
+        const inventory = await source.changeInventory();
+        expect(inventory.status).toBe('complete');
+        expect(inventory.next).toBeNull();
+        expect(inventory.items).toHaveLength(110);
+        expect(inventory.excludedPaths).toContain('.env.local');
+        expect(inventory.items.some((item) => item.head?.path === '.env.local')).toBe(false);
+        const late = inventory.items.find((item) => item.head?.path === 'zz/Editor.tsx')!;
+        expect(late.offset).toBeGreaterThan(100);
+        const selected = await source.diff({ offset: late.offset, patchLineOffset: 0 });
+        expect(selected.items[0]!.change.head?.path).toBe('zz/Editor.tsx');
+        expect(selected.items[0]!.patch).toContain('<button>Save</button>');
+        expect(JSON.stringify(inventory)).not.toContain('<button>');
+        expect(existsSync(join(f.root, 'EXECUTED'))).toBe(false);
+    });
+    it('prepares ordinary Git patches with fixed source provenance and no parallel hunk encoding', async () => {
+        const f = fixture();
+        const source = new api.FixedSnapshotSource(api.fixGitIdentity(f.root, f.base, f.head));
+        const diff = await source.diff();
+        expect(diff.status).toBe('complete');
+        expect(diff.items.map((item) => item.change.kind).sort()).toEqual([
+            'addition',
+            'deletion',
+            'modification',
+            'rename',
+        ]);
+        const modified = diff.items.find((item) => item.change.kind === 'modification')!;
+        expect(modified.status).toBe('complete');
+        expect(modified.patch).toMatch(/^@@ /mu);
+        for (const item of diff.items) {
+            expect(item.hash).toMatch(/^sha256:[a-f0-9]{64}$/u);
+            expect(item).not.toHaveProperty('hunks');
+            const paths = [
+                ...new Set([item.change.base?.path, item.change.head?.path].filter((path): path is string => !!path)),
+            ];
+            expect(item.patch).toBe(normalPatch(f, paths));
+            if (item.change.base) expect(item.change.base.commit).toBe(f.base);
+            if (item.change.head) expect(item.change.head.commit).toBe(f.head);
+        }
+        const rename = diff.items.find((item) => item.change.kind === 'rename')!;
+        expect(rename.change.base?.path).toBe('old name.ts');
+        expect(rename.change.head?.path).toBe('new name.ts');
+        expect(existsSync(join(f.root, 'EXECUTED'))).toBe(false);
+    });
+    it('continues bounded patch pages without dropping or duplicating diff lines', async () => {
+        const f = fixture();
+        const artifact = api.fixGitIdentity(f.root, f.base, f.head);
+        const full = await new api.FixedSnapshotSource(artifact).diff();
+        const source = new api.FixedSnapshotSource(artifact, { pageEntries: 1, readLines: 8, readBytes: 1024 });
+        const collected = new Map<string, string>();
+        let cursor: Parameters<typeof source.diff>[0];
+        for (let pageNumber = 0; ; pageNumber++) {
+            expect(pageNumber).toBeLessThan(30);
+            const page = await source.diff(cursor);
+            const patch = page.items.map((item) => item.patch).join('');
+            expect(Buffer.byteLength(patch)).toBeLessThanOrEqual(source.limits.readBytes);
+            expect((patch.match(/\n/gu) ?? []).length).toBeLessThanOrEqual(source.limits.readLines);
+            for (const item of page.items) {
+                const path = item.change.head?.path ?? item.change.base!.path;
+                collected.set(path, (collected.get(path) ?? '') + item.patch);
+            }
+            if (!page.next) break;
+            expect(page.status).toBe('truncated');
+            cursor = page.next;
+        }
+        for (const item of full.items) {
+            const paths = [
+                ...new Set([item.change.base?.path, item.change.head?.path].filter((path): path is string => !!path)),
+            ];
+            expect(collected.get(item.change.head?.path ?? item.change.base!.path)).toBe(normalPatch(f, paths));
+        }
+    });
+    it('accounts for excluded credential paths and oversized diff lines without transmitting their contents', async () => {
+        const f = fixture();
+        f.write('.env.local', 'UNSAFE_TEST_SECRET=never-include-this-content\n');
+        f.write('oversized.ts', 'x'.repeat(5000) + '\n');
+        f.git('add', '-f', '--', '.env.local', 'oversized.ts');
+        f.git('-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgSign=false', 'commit', '-m', 'synthetic bounds');
+        const source = new api.FixedSnapshotSource(api.fixGitIdentity(f.root, f.base, 'HEAD'), { readBytes: 1024 });
+        const seen: Array<Awaited<ReturnType<typeof source.diff>>['items'][number]> = [];
+        let cursor: Parameters<typeof source.diff>[0];
+        for (let pageNumber = 0; ; pageNumber++) {
+            expect(pageNumber).toBeLessThan(10);
+            const page = await source.diff(cursor);
+            seen.push(...page.items);
+            expect(JSON.stringify(page)).not.toContain('never-include-this-content');
+            if (!page.next) break;
+            cursor = page.next;
+        }
+        expect(seen.some((item) => item.reason === 'sensitive_path_excluded')).toBe(true);
+        expect(seen.some((item) => item.reason === 'diff_line_exceeds_response_limit')).toBe(true);
+        expect(existsSync(join(f.root, 'EXECUTED'))).toBe(false);
+    });
     it('searches one exact pinned path, binds continuations to that path and rejects unavailable scope', async () => {
         const f = fixture();
         const source = new api.FixedSnapshotSource(api.fixGitIdentity(f.root, f.base, f.head), { searchMatches: 1 });

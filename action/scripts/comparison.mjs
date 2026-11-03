@@ -1,72 +1,15 @@
-import { Buffer } from 'node:buffer';
-import { spawnSync } from 'node:child_process';
-import { join } from 'node:path';
-import { config, currentPR, e, eligible, fail, gitEnvironment, guarded, write } from './common.mjs';
-
+import { config, e, guarded, loadReviewerModule, output } from './common.mjs';
 await guarded('comparison', async () => {
-    const c = config(),
-        pr = await currentPR(c);
-    if (!eligible(pr, c)) fail('ineligible_pr');
-    const fixed = c.fixed ?? { base: pr.base.sha, head: pr.head.sha };
-    if (pr.base.sha !== fixed.base || pr.head.sha !== fixed.head) fail('superseded_comparison');
-    const repository = join(e.REVIEW_ROOT, 'comparison');
-    const git = (args, authenticated = false) => {
-        const env = gitEnvironment();
-        if (authenticated)
-            Object.assign(env, {
-                GIT_CONFIG_COUNT: '1',
-                GIT_CONFIG_KEY_0: 'http.https://github.com/.extraheader',
-                GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${Buffer.from(`x-access-token:${e.GH_READ_TOKEN}`).toString('base64')}`,
-            });
-        const result = spawnSync(
-            'git',
-            [
-                '-c',
-                'core.hooksPath=/dev/null',
-                '-c',
-                'core.fsmonitor=false',
-                '-c',
-                'credential.helper=',
-                '-c',
-                'protocol.file.allow=never',
-                ...args,
-            ],
-            { env, stdio: 'pipe', timeout: 120000, encoding: 'utf8' },
-        );
-        if (result.status !== 0) fail('git_fetch_failed');
-        return result.stdout.trim();
-    };
-    git(['init', '--template=', repository]);
-    git(['-C', repository, 'remote', 'add', 'origin', `https://github.com/${c.repository}.git`]);
-    // The base repository exposes PR heads, including forks; no contributor remote is trusted.
-    git(
-        [
-            '-C',
-            repository,
-            'fetch',
-            '--no-tags',
-            '--no-recurse-submodules',
-            'origin',
-            fixed.base,
-            `refs/pull/${c.pr}/head:refs/contextrail/review-head`,
-        ],
-        true,
-    );
-    if (git(['-C', repository, 'rev-parse', '--verify', 'refs/contextrail/review-head^{commit}']) !== fixed.head)
-        fail('superseded_comparison');
-    for (const commit of Object.values(fixed)) {
-        if (git(['-C', repository, 'rev-parse', '--verify', `${commit}^{commit}`]) !== commit)
-            fail('fixed_commit_invalid');
-    }
-    // Recheck after fetch, before provider credentials are introduced.
-    const latest = await currentPR(c);
-    if (!eligible(latest, c) || latest.base.sha !== fixed.base || latest.head.sha !== fixed.head)
-        fail('superseded_comparison');
-    write(join(e.REVIEW_ROOT, 'comparison.json'), {
-        ...fixed,
+    const c = config();
+    const { prepareGitHubReview } = await loadReviewerModule('github');
+    const prepared = await prepareGitHubReview({
         repository: c.repository,
-        pr: c.pr,
-        workflowSha: e.GITHUB_WORKFLOW_SHA,
-        freshness: 'current_before_review',
+        prNumber: c.pr,
+        reviewer: c.reviewer,
+        outputDir: e.REVIEW_ROOT,
+        baseBranch: c.baseBranch,
+        fixed: c.fixed,
+        token: e.GH_READ_TOKEN,
     });
+    output('pr-context-path', prepared.prContextPath);
 });

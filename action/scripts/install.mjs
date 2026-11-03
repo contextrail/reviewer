@@ -4,12 +4,9 @@ import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { e, fail, guarded, output, read, runtimeEnvironment, write } from './common.mjs';
 
-await guarded('setup', () => {
-    const startedAt = new Date().toISOString();
-    e.REVIEW_ROOT = mkdtempSync(join(e.RUNNER_TEMP, 'contextrail-review-'));
-    output('root', e.REVIEW_ROOT);
-    const positive = (v, max) => /^[1-9][0-9]*$/.test(v ?? '') && Number.isSafeInteger(Number(v)) && Number(v) <= max;
-    const bounded = (v, pattern, max = 500) => typeof v === 'string' && v.length <= max && pattern.test(v);
+const positive = (v, max) => /^[1-9][0-9]*$/.test(v ?? '') && Number.isSafeInteger(Number(v)) && Number(v) <= max;
+const bounded = (v, pattern, max = 500) => typeof v === 'string' && v.length <= max && pattern.test(v);
+function validatePackageVersion() {
     // Exact SemVer only: no dist-tags, ranges, URLs, aliases, leading v or local paths.
     const number = '(?:0|[1-9][0-9]*)';
     const prerelease = `(?:${number}|[0-9]*[A-Za-z-][0-9A-Za-z-]*)`;
@@ -18,13 +15,16 @@ await guarded('setup', () => {
     );
     if (!e.PACKAGE_VERSION) fail('package_version_missing');
     if (!bounded(e.PACKAGE_VERSION, version, 100)) fail('invalid_package_version');
-    const url = (() => {
-        try {
-            return new globalThis.URL(e.MCP_URL);
-        } catch {
-            return null;
-        }
-    })();
+}
+function mcpUrl() {
+    try {
+        return new globalThis.URL(e.MCP_URL);
+    } catch {
+        return null;
+    }
+}
+function validateMcpConfiguration() {
+    const url = mcpUrl();
     if (
         !bounded(e.REVIEWER, /^skill:\/\/[A-Za-z0-9._/-]+$/) ||
         !url ||
@@ -33,12 +33,22 @@ await guarded('setup', () => {
         url.password ||
         url.search ||
         url.hash ||
-        !bounded(e.MCP_ORG_ID, /^[A-Za-z0-9._-]+$/, 200) ||
+        !bounded(e.MCP_ORG_ID, /^[A-Za-z0-9._-]+$/, 200)
+    )
+        fail('invalid_configuration');
+}
+function validateModelConfiguration() {
+    if (
         !['openai', 'openrouter'].includes(e.PROVIDER) ||
         !bounded(e.MODEL, /^[A-Za-z0-9._:/-]+$/, 200) ||
         !['', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh'].includes(e.EFFORT) ||
         !positive(e.MAX_TIME_MS, 2147483647) ||
-        !['send', 'off'].includes(e.FEEDBACK) ||
+        !['send', 'off'].includes(e.FEEDBACK)
+    )
+        fail('invalid_configuration');
+}
+function validateActionConfiguration() {
+    if (
         !['true', 'false'].includes(e.REPOSITORY_ATTRIBUTION) ||
         !positive(e.ARTIFACT_RETENTION_DAYS, 90) ||
         !positive(e.PR_NUMBER, Number.MAX_SAFE_INTEGER) ||
@@ -47,7 +57,30 @@ await guarded('setup', () => {
         e.GITHUB_SERVER_URL !== 'https://github.com'
     )
         fail('invalid_configuration');
-    output('retention', e.ARTIFACT_RETENTION_DAYS);
+}
+function validatePhaseModel(phase, value) {
+    if (!['plan', 'assess', 'verify'].includes(phase) || !value || typeof value !== 'object' || Array.isArray(value))
+        throw new Error('invalid phase model');
+    if (
+        Object.keys(value).some((key) => !['provider', 'model', 'effort'].includes(key)) ||
+        !['openai', 'openrouter'].includes(value.provider) ||
+        !bounded(value.model, /^[A-Za-z0-9._:/-]+$/, 200) ||
+        (value.effort !== undefined && !['none', 'minimal', 'low', 'medium', 'high', 'xhigh'].includes(value.effort))
+    )
+        throw new Error('invalid phase model');
+}
+function parsePhaseModels() {
+    let phaseModels;
+    try {
+        phaseModels = JSON.parse(e.PHASE_MODELS || '{}');
+        if (!phaseModels || typeof phaseModels !== 'object' || Array.isArray(phaseModels)) throw new Error();
+        for (const [phase, value] of Object.entries(phaseModels)) validatePhaseModel(phase, value);
+    } catch {
+        fail('invalid_phase_models');
+    }
+    return phaseModels;
+}
+function eventComparison() {
     const event = read(e.GITHUB_EVENT_PATH);
     let fixed = null;
     if (['pull_request', 'pull_request_target'].includes(e.GITHUB_EVENT_NAME)) {
@@ -55,6 +88,21 @@ await guarded('setup', () => {
         fixed = { base: event.pull_request?.base?.sha, head: event.pull_request?.head?.sha };
         if (!Object.values(fixed).every((v) => /^[a-f0-9]{40}$/.test(v ?? ''))) fail('event_comparison_invalid');
     }
+    return fixed;
+}
+function configuration(startedAt) {
+    const phaseModels = parsePhaseModels();
+    const maxParallel = e.MAX_PARALLEL || '3',
+        logLevel = e.LOG_LEVEL || 'info';
+    if (
+        !positive(maxParallel, 50) ||
+        !['quiet', 'info', 'debug'].includes(logLevel) ||
+        (e.INLINE_COMMENTS && !['true', 'false'].includes(e.INLINE_COMMENTS)) ||
+        (e.INLINE_COMMENTS === 'true' && e.POST_COMMENT !== 'true')
+    )
+        fail('invalid_configuration');
+    output('retention', e.ARTIFACT_RETENTION_DAYS);
+    const fixed = eventComparison();
     const c = {
         startedAt,
         nodeVersion: process.version,
@@ -65,6 +113,10 @@ await guarded('setup', () => {
         provider: e.PROVIDER,
         model: e.MODEL,
         effort: e.EFFORT,
+        phaseModels,
+        maxParallel: Number(maxParallel),
+        logLevel,
+        inlineComments: e.INLINE_COMMENTS === 'true',
         maxTimeMs: e.MAX_TIME_MS,
         feedback: e.FEEDBACK,
         repositoryAttribution: e.REPOSITORY_ATTRIBUTION === 'true',
@@ -73,6 +125,9 @@ await guarded('setup', () => {
         baseBranch: e.BASE_BRANCH,
         fixed,
     };
+    return c;
+}
+function installPackage(c) {
     write(join(e.REVIEW_ROOT, 'config.json'), c);
     const tool = join(e.REVIEW_ROOT, 'tool');
     mkdirSync(tool);
@@ -118,4 +173,14 @@ await guarded('setup', () => {
         fail('installed_package_invalid');
     copyFileSync(join(tool, 'package-lock.json'), join(e.REVIEW_ROOT, 'package-lock.json'));
     write(join(e.REVIEW_ROOT, 'setup-status.json'), { status: 'installed', package: pkg.name, version: pkg.version });
+}
+await guarded('setup', () => {
+    const startedAt = new Date().toISOString();
+    e.REVIEW_ROOT = mkdtempSync(join(e.RUNNER_TEMP, 'contextrail-review-'));
+    output('root', e.REVIEW_ROOT);
+    validatePackageVersion();
+    validateMcpConfiguration();
+    validateModelConfiguration();
+    validateActionConfiguration();
+    installPackage(configuration(startedAt));
 });

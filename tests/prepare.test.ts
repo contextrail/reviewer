@@ -2,10 +2,11 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, writeFileSync, rmSync, readdirSync, cpSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, afterEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { PreparationReadError, type Publication, type PublishedReader, type ScopePage } from '../src/contracts.js';
-import { digest, prepareReview } from '../src/prepare.js';
-import { fixGitIdentity, repositoryEnvironment } from '../src/git.js';
+import { digest, prepareReview, writePreparationArtifacts } from '../src/prepare.js';
+import { fixGitIdentity, repositoryEnvironment, readableDiff } from '../src/git.js';
+import { FixedSnapshotSource, SourceAccessError } from '../src/source.js';
 
 const reviewerId = 'skill://engineering/c1';
 const ids = ['context://engineering/a', 'context://engineering/b', 'context://engineering/c'];
@@ -22,20 +23,18 @@ const reviewer: Publication = {
     relationships: [],
     content: { kind: 'skill', instructions: 'Review every selected context.', reviewer: { selections } },
 };
-const contexts = ids.map(
-    (nodeId, index): Publication => ({
-        nodeId,
-        domainId: 'engineering',
-        title: `Context ${index}`,
-        type: 'context',
-        subtype: 'standard',
-        status: 'published',
-        version: index + 1,
-        detailLevel: 'full',
-        relationships: [],
-        content: { kind: 'context', body: `Original prose ${index}.` },
-    }),
-);
+const contexts = ids.map((nodeId, index): Publication => ({
+    nodeId,
+    domainId: 'engineering',
+    title: `Context ${index}`,
+    type: 'context',
+    subtype: 'standard',
+    status: 'published',
+    version: index + 1,
+    detailLevel: 'full',
+    relationships: [],
+    content: { kind: 'context', body: `Original prose ${index}.` },
+}));
 const entries = contexts.map((context, i) => ({
     nodeId: context.nodeId,
     version: context.version,
@@ -45,6 +44,7 @@ const entries = contexts.map((context, i) => ({
 }));
 const directories: string[] = [];
 afterEach(() => {
+    vi.restoreAllMocks();
     for (const dir of directories.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -125,6 +125,9 @@ function createRepository() {
     const git = (...args: string[]) =>
         execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
     git('init', '-b', 'test');
+    // Copied fixtures make later commits too; identity must travel with the repository.
+    git('config', '--local', 'user.name', 'C1');
+    git('config', '--local', 'user.email', 'c1@example.test');
     writeFileSync(join(root, 'file.txt'), 'base');
     git('add', 'file.txt');
     git('-c', 'user.name=C1', '-c', 'user.email=c1@example.test', 'commit', '-m', 'base');
@@ -185,6 +188,136 @@ function run(repo: ReturnType<typeof repository>, source: PublishedReader = read
 }
 
 describe('deterministic preparation', () => {
+    it('seals a complete changed-file inventory independently of the first patch page', async () => {
+        const repo = repository();
+        writeFileSync(join(repo.root, 'zz-late-ui.tsx'), 'export const Save = () => <button>Save</button>;\n');
+        repo.git('add', '--', 'zz-late-ui.tsx');
+        repo.git(
+            '-c',
+            'core.hooksPath=/dev/null',
+            '-c',
+            'commit.gpgSign=false',
+            'commit',
+            '-m',
+            'synthetic late UI surface',
+        );
+        const prepared = await prepareReview({
+            repository: repo.root,
+            base: repo.base,
+            head: 'HEAD',
+            reviewerId,
+            reader: reader(),
+            sourceLimits: { readLines: 1 },
+        });
+        expect(prepared.state.preparationStatus).toBe('prepared');
+        expect(prepared.state.diff?.status).toBe('truncated');
+        expect(prepared.state.diff?.items.some((item) => item.change.head?.path === 'zz-late-ui.tsx')).toBe(false);
+        expect(prepared.state.changes?.status).toBe('complete');
+        expect(prepared.state.changes?.items.some((item) => item.head?.path === 'zz-late-ui.tsx')).toBe(true);
+        const manifest = JSON.parse(readFileSync(prepared.manifestPath, 'utf8'));
+        expect(manifest.changesHash).toBe(digest(prepared.state.changes));
+    });
+    it('preserves an incomplete inventory as a preparation gap rather than a complete prefix', async () => {
+        vi.spyOn(FixedSnapshotSource.prototype, 'changes').mockRejectedValueOnce(
+            new SourceAccessError('unavailable', 'Synthetic missing object.'),
+        );
+        const prepared = await run(repository());
+        expect(prepared.state.preparationStatus).toBe('incomplete');
+        expect(prepared.state.changes).toMatchObject({
+            status: 'truncated',
+            reason: 'unavailable',
+            next: { offset: 0 },
+        });
+        expect(prepared.state.gaps).toContainEqual({ code: 'change_inventory_incomplete', reason: 'unavailable' });
+        expect(readFileSync(prepared.statePath, 'utf8')).toContain('change_inventory_incomplete');
+    });
+    it('writes an ordinary Git diff and readable entry point with exact file hashes', async () => {
+        const repo = repository();
+        const prepared = await run(repo);
+        const directory = join(repo.root, '.contextrail', 'reviewer', prepared.state.runId);
+        const patch = readFileSync(join(directory, 'diff.patch'), 'utf8');
+        const ordinary = execFileSync(
+            'git',
+            ['-C', repo.root, 'diff', '--no-ext-diff', '--no-textconv', '--no-color', repo.base, repo.head],
+            { encoding: 'utf8' },
+        );
+        expect(patch).toBe(ordinary);
+        expect(readableDiff(repo.artifact).patch).toBe(ordinary);
+        const page = readFileSync(join(directory, 'preparation.md'), 'utf8');
+        expect(page).toContain(repo.base);
+        expect(page).toContain(repo.head);
+        expect(page).toContain('[diff.patch](diff.patch)');
+        expect(page).toContain('Governed scope');
+        const manifest = JSON.parse(readFileSync(prepared.manifestPath, 'utf8'));
+        expect(manifest.files['diff.patch']).toMatch(/^sha256:[a-f0-9]{64}$/u);
+        const backfill = await writePreparationArtifacts(prepared.state, directory);
+        expect(backfill.status).toBe('available');
+        expect(backfill.files).toEqual(manifest.files);
+    });
+    it('excludes credential-path renames and marks output-bound failures without presenting a partial diff', async () => {
+        const repo = repository();
+        writeFileSync(join(repo.root, '.env'), 'NOT_REAL_SECRET=keep-this-out-of-the-patch\n');
+        repo.git('add', '-f', '--', '.env');
+        repo.git(
+            '-c',
+            'core.hooksPath=/dev/null',
+            '-c',
+            'commit.gpgSign=false',
+            'commit',
+            '-m',
+            'synthetic credential input',
+        );
+        const base = repo.git('rev-parse', 'HEAD');
+        repo.git('mv', '.env', 'renamed-secret.txt');
+        writeFileSync(join(repo.root, 'allowed.txt'), 'permitted changed source\n');
+        repo.git('add', '--', 'allowed.txt');
+        repo.git('-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgSign=false', 'commit', '-m', 'synthetic rename');
+        const artifact = fixGitIdentity(repo.root, base, 'HEAD');
+        const diff = readableDiff(artifact);
+        expect(diff.patch).toContain('permitted changed source');
+        expect(diff.patch).not.toContain('keep-this-out-of-the-patch');
+        expect(diff.excludedPaths).toEqual(['.env', 'renamed-secret.txt']);
+        const prepared = await run(repo);
+        const directory = join(repo.root, '.contextrail', 'reviewer', prepared.state.runId);
+        const bounded = await writePreparationArtifacts({ ...prepared.state, artifact }, directory, { maxBytes: 1 });
+        expect(bounded.status).toBe('unavailable');
+        expect(() => readFileSync(join(directory, 'diff.patch'))).toThrow();
+        expect(readFileSync(join(directory, 'preparation.md'), 'utf8')).toContain(
+            'No partial diff.patch is presented as complete',
+        );
+        expect(readFileSync(prepared.statePath, 'utf8')).toContain(prepared.state.runId);
+    });
+    it('pins a prepared hunk page and manifest without treating retrieval as evaluation', async () => {
+        const prepared = await run(repository());
+        expect(prepared.state.diff?.items.length).toBeGreaterThan(0);
+        expect(prepared.state.entries.every((entry) => entry.result.disposition === 'not_evaluated')).toBe(true);
+        const manifest = JSON.parse(readFileSync(prepared.manifestPath, 'utf8'));
+        expect(manifest.scopeIdentity).toBe(prepared.state.scopeIdentity);
+        expect(manifest.diffHash).toBe(digest(prepared.state.diff));
+        expect(manifest.entries.map((entry: { assessmentId: string }) => entry.assessmentId)).toEqual(
+            prepared.state.entries.map((entry) => entry.assessmentId),
+        );
+    });
+    it('preserves restrictions on invoking other skills without blocking internal assessment phases', async () => {
+        const source = reader();
+        const instructions =
+            'Company guidance is fixed. Optional follow-up skill://engineering/api/api-contract-review is not an executable dependency. This runtime does not invoke specialists; this review does not invoke another reviewer.';
+        const result = await run(repository(), {
+            async read(name, args) {
+                const value = await source.read(name, args);
+                if (name === 'get_skill') (value as Publication).content.instructions = instructions;
+                return value;
+            },
+        });
+        expect(result.state.preparationStatus).toBe('prepared');
+        expect(result.state.entries).toHaveLength(3);
+        expect(result.state.gaps).toEqual([]);
+        expect(result.state.reviewer?.content.instructions).toBe(instructions);
+        expect(
+            source.calls.filter((call) => call.name === 'get_skill').every((call) => call.args.nodeId === reviewerId),
+        ).toBe(true);
+        expect(result.state.entries.map((entry) => entry.nodeId)).toEqual(ids);
+    });
     it('enumerates once, pins original material and preserves all not-evaluated slots and overlap reasons', async () => {
         const repo = repository();
         const source = reader();
