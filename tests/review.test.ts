@@ -1630,6 +1630,148 @@ describe('one coherent investigation and one independent check', () => {
         expect(requests.filter((r) => r.phase === 'verify')).toHaveLength(1);
         expect(result.state.execution.calls).toBe(3);
     });
+    it('recovers SDK parsing after 17 accepted assessments without replaying tools, then verifies all 20', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        const prepared = await createPreparedFixture(20);
+        directories.push(prepared.state.artifact.repository);
+        let injected = false;
+        let failedRequest = '';
+        let replayMatched = false;
+        const wire = fixtureWire(prepared, 'openrouter', {
+            mutate(phase, payload, n) {
+                if (phase === 'assess')
+                    payload.assessments = n === 1 ? payload.assessments.slice(0, 17) : payload.assessments.slice(17);
+            },
+        });
+        const result = await runReview({
+            ...fixtureOptions(prepared),
+            fetch: async (url, init) => {
+                const partialPath = join(dirname(prepared.statePath), 'phases/partial-assess-all-1.json');
+                const retained = existsSync(partialPath)
+                    ? JSON.parse(readFileSync(partialPath, 'utf8')).output.assessments.length
+                    : 0;
+                if (!injected && retained === 17) {
+                    injected = true;
+                    failedRequest = String(init?.body);
+                    // Native JSON accepts this; the SDK's secure parser rejects it before tool execution.
+                    return new Response(
+                        '{"__proto__":{},"usage":{"prompt_tokens":12,"completion_tokens":8,"total_tokens":20,"cost":0.001}}',
+                        { headers: { 'content-type': 'application/json' } },
+                    );
+                }
+                if (failedRequest && !replayMatched) {
+                    expect(String(init?.body)).toBe(failedRequest);
+                    replayMatched = true;
+                }
+                return wire(url, init);
+            },
+        });
+        expect(replayMatched).toBe(true);
+        expect(result.state.verification.verified).toBe(20);
+        expect(result.state.execution.calls).toBe(5);
+        expect(result.state.execution.steps).toBe(4);
+        expect(result.state.execution.usage).toHaveLength(5);
+        const events = readFileSync(join(result.directory, 'diagnostics.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line));
+        expect(events.filter((event) => event.kind === 'provider_retry')).toMatchObject([
+            { data: { count: 1, causes: ['AI_APICallError', 'AI_JSONParseError', 'SyntaxError'] } },
+        ]);
+        expect(
+            events.filter((event) => event.kind === 'tool_started' && event.data.tool === 'read_source'),
+        ).toHaveLength(1);
+        expect(
+            events.filter((event) => event.kind === 'assessment_progress').flatMap((event) => event.data.newlyAccepted),
+        ).toHaveLength(20);
+    });
+    it.each([401, 402, 403, 400, 429, 503])('bounds provider recovery for HTTP %s', async (status) => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        const prepared = await preparedFixture();
+        const fetch = vi.fn(async () => new Response('{}', { status }));
+        const result = await runReview({ ...fixtureOptions(prepared), fetch });
+        expect(fetch).toHaveBeenCalledTimes(status === 429 || status === 503 ? 3 : 1);
+        expect(result.state.decision?.exitCode).toBe(2);
+        expect(result.state.verification.verified).toBe(0);
+    });
+    it('recovers the verifier without repeating the assessment', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        const prepared = await preparedFixture();
+        const wire = fixtureWire(prepared);
+        let verificationCalls = 0;
+        const result = await runReview({
+            ...fixtureOptions(prepared),
+            fetch: async (url, init) => {
+                if (
+                    phaseRequest(JSON.parse(String(init?.body)), prepared).phase === 'verify' &&
+                    ++verificationCalls === 1
+                )
+                    return new Response('{}', { status: 503 });
+                return wire(url, init);
+            },
+        });
+        expect(verificationCalls).toBe(2);
+        expect(result.state.verification.verified).toBe(2);
+        expect(result.state.execution.calls).toBe(4);
+        expect(result.state.phases.map((phase) => phase.phase)).toEqual(['assess', 'verify']);
+    });
+    it('bounds malformed response recovery and never accepts it', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        const prepared = await preparedFixture();
+        const fetch = vi.fn(async () => new Response('broken-json'));
+        const result = await runReview({ ...fixtureOptions(prepared), fetch });
+        expect(fetch).toHaveBeenCalledTimes(3);
+        expect(result.state.decision?.exitCode).toBe(2);
+        expect(result.state.verification.verified).toBe(0);
+    });
+    it('honors the original deadline before sending a recovery request', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        const prepared = await preparedFixture();
+        let now = Date.now();
+        const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+        try {
+            const fetch = vi.fn(async () => {
+                now += 600000;
+                return new Response('{}', { status: 503 });
+            });
+            const result = await runReview({ ...fixtureOptions(prepared), limits: { maxTimeMs: 600000 }, fetch });
+            expect(fetch).toHaveBeenCalledTimes(1);
+            expect(result.state.execution.stopReason).toBe('verification_time_reserved');
+        } finally {
+            clock.mockRestore();
+        }
+    });
+    it('reports deadline cancellation during backoff as a budget stop', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        const prepared = await preparedFixture();
+        const result = await runReview({
+            ...fixtureOptions(prepared),
+            limits: { maxTimeMs: 200 },
+            fetch: async () => new Response('{}', { status: 503 }),
+        });
+        expect(result.state.execution.stopReason).toBe('verification_time_reserved');
+        expect(result.state.verification.verified).toBe(0);
+    });
+    it('honors cancellation during recovery backoff', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        const prepared = await preparedFixture();
+        const controller = new AbortController();
+        const fetch = vi.fn(async () => {
+            setTimeout(() => controller.abort(), 20);
+            return new Response('{}', { status: 503 });
+        });
+        const result = await runReview({ ...fixtureOptions(prepared), signal: controller.signal, fetch });
+        expect(fetch).toHaveBeenCalledTimes(1);
+        expect(result.state.execution.stopReason).toBe('cancelled');
+    });
+    it('does not grant recovery a fresh call budget', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        const prepared = await preparedFixture();
+        const fetch = vi.fn(async () => new Response('{}', { status: 503 }));
+        const result = await runReview({ ...fixtureOptions(prepared), limits: { maxTurns: 3 }, fetch });
+        expect(fetch).toHaveBeenCalledTimes(1);
+        expect(result.state.execution.stopReason).toBe('verification_calls_reserved');
+    });
     it('continues after an early stop with only missing IDs and never rewrites accepted judgments', async () => {
         vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
         const prepared = await preparedFixture();

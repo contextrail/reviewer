@@ -1,4 +1,5 @@
-import type { LanguageModel } from 'ai';
+import { wrapLanguageModel } from 'ai';
+import { setTimeout as delay } from 'node:timers/promises';
 import { createOpenAI } from '@ai-sdk/openai';
 
 export type ReviewProvider = 'openai' | 'openrouter';
@@ -135,11 +136,59 @@ export function providerFailureDiagnostics(error: unknown) {
     return { causes, validation };
 }
 
+/** Retry only failed provider operations, before any response tools execute. */
+export function recoverProviderCalls(
+    model: Parameters<typeof wrapLanguageModel>[0]['model'],
+    signal: AbortSignal,
+    onRetry: (retry: number, error: unknown) => Promise<unknown>,
+): ReturnType<typeof wrapLanguageModel> {
+    let retries = 0;
+    return wrapLanguageModel({
+        model,
+        middleware: {
+            specificationVersion: 'v4',
+            wrapGenerate: async ({ doGenerate }) => {
+                for (;;) {
+                    signal.throwIfAborted();
+                    try {
+                        return await doGenerate();
+                    } catch (error) {
+                        if (signal.aborted || retries >= 2 || !recoverableProviderError(error)) throw error;
+                        retries++;
+                        await onRetry(retries, error);
+                        await delay(250 * 2 ** (retries - 1), undefined, { signal });
+                    }
+                }
+            },
+        },
+    });
+}
+function recoverableProviderError(error: unknown): boolean {
+    // Our usage reader parses the same response before the SDK; malformed JSON can surface here directly.
+    if (error instanceof SyntaxError) return true;
+    if (!(error instanceof Error) || error.name !== 'AI_APICallError') return false;
+    const failure = error as Error & { statusCode?: number; isRetryable?: boolean };
+    const status = failure.statusCode;
+    if (status === 408 || status === 429 || (status !== undefined && status >= 500 && status <= 599)) return true;
+    if (status === undefined) return failure.isRetryable === true;
+    // A successful HTTP response can still fail SDK parsing/validation. Never relax that validation.
+    return (
+        status >= 200 &&
+        status < 300 &&
+        providerFailureDiagnostics(error).causes.some(
+            (cause) => cause === 'AI_JSONParseError' || cause === 'AI_TypeValidationError',
+        )
+    );
+}
+
 /** Construction only; no model substitution, retries, or domain policy. */
 export function reviewModel(
     config: ProviderConfiguration,
     fetcher: typeof fetch = fetch,
-): { model: LanguageModel; providerOptions: Record<string, Record<string, string | boolean>> } {
+): {
+    model: Parameters<typeof wrapLanguageModel>[0]['model'];
+    providerOptions: Record<string, Record<string, string | boolean>>;
+} {
     if (!['openai', 'openrouter'].includes(config.provider)) throw new Error('provider_selection_invalid');
     const key = process.env[config.provider === 'openai' ? 'OPENAI_API_KEY' : 'OPENROUTER_API_KEY'];
     if (!key?.trim()) throw new Error('provider_credential_missing');

@@ -36,10 +36,10 @@ an instruction-only reviewer cannot supply this CLI's assessment scope.
 
 Install an exact published version from public npm (alpha versions use npm's `alpha` channel).
 The package is Apache-2.0 licensed. This source checkout's selected version is
-`1.0.0-alpha.6`; its immutable export attribution is in `release.json`.
+`1.0.0-alpha.7`; its immutable export attribution is in `release.json`.
 
 ```sh
-npm install --ignore-scripts @contextrail/code-review-agent@1.0.0-alpha.6
+npm install --ignore-scripts @contextrail/code-review-agent@1.0.0-alpha.7
 ./node_modules/.bin/contextrail-review --help
 ```
 
@@ -130,6 +130,13 @@ now uses one coherent assessment session, followed by one independent verificati
 `--log-level quiet|info|debug` defaults to info; stdout retains machine JSON while safe progress
 goes to stderr. All levels retain required diagnostics. Execution limits cover the invocation,
 including bounded continuation of unfinished submissions. No stronger-model fallback is implicit.
+Provider recovery allows at most two additional requests per phase, with 250ms then 500ms
+backoff, for transport failures marked retryable by the SDK, HTTP 408/429/5xx and response
+parsing/validation failures. It repeats only the failed model request with the existing conversation;
+completed tools and accepted assessments are not replayed. Each request consumes the original
+call/time/token budget, and cancellation interrupts the backoff. Authentication, credit-limit and
+configuration failures stop immediately. Recovery is separate from submission correction and
+unfinished-assessment continuation; `provider_retry` events appear at info/debug verbosity.
 The observed token cutoff can overshoot by one call and is not a dollar ceiling.
 Execution completion, assessment coverage, verification coverage and policy acceptance
 are separate fields. Schema validity and exact citations do not prove a judgment correct.
@@ -329,7 +336,7 @@ Select an independently reviewed public Action SHA and an exact qualified npm ve
 ```yaml
 - uses: contextrail/reviewer/action@ACTION_COMMIT_SHA
   with:
-      package-version: '1.0.0-alpha.6'
+      package-version: '1.0.0-alpha.7'
       pr-number: ${{ github.event.pull_request.number }}
       base-branch: alpha
       reviewer: skill://your-domain/your-reviewer

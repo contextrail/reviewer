@@ -13,6 +13,7 @@ import { CitationError, EvidenceLedger, modelEvidence, resolveCitationSelections
 import { DEFAULT_POLICY, decideExit, type ReviewEntry, type ReviewPolicy } from './results.js';
 import {
     reviewModel,
+    recoverProviderCalls,
     reportedUsage,
     providerFailureDiagnostics,
     providerHttpFailure,
@@ -909,12 +910,23 @@ async function runPhaseModel<T>(session: PhaseRuntime<T>) {
     const { state, diagnostics, models, limits } = run;
     const tools = createPhaseTools(session),
         wire = createProviderFetch(session);
+    const configured = reviewModel(models[phase], wire);
+    const model = recoverProviderCalls(configured.model, signal, (count, error) =>
+        diagnostics.event('provider_retry', {
+            phase,
+            workUnitId,
+            attempt,
+            count,
+            ...providerFailureDiagnostics(error),
+        }),
+    );
     signal.throwIfAborted();
     let continuation = 0;
     let messages: import('ai').ModelMessage[] = [{ role: 'user', content: JSON.stringify(sanitizeRecord(payload)) }];
     for (; session.output === undefined;) {
         const generated = await generateText({
-            ...reviewModel(models[phase], wire),
+            ...configured,
+            model,
             system: instructions,
             messages,
             tools,
@@ -1078,7 +1090,7 @@ async function invokePhase<T>(
     try {
         await runPhaseModel(session);
     } catch (error) {
-        failure = error;
+        failure = session.signal.aborted ? new BudgetStop(phaseStopReason(session, error)!) : error;
         await run.diagnostics.event('phase_failed', {
             phase,
             workUnitId,
