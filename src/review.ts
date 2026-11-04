@@ -9,7 +9,13 @@ import { assessmentCoverage } from './presentation.js';
 import { parsePrContext, type PrContext } from './pr-context.js';
 import { sendReviewReport, type ReportingStatus, type ReviewFeedbackSender } from './feedback.js';
 import { atomicJson, digest, structuredRequirements, type PreparedState } from './prepare.js';
-import { CitationError, EvidenceLedger, modelEvidence, resolveCitationSelections } from './evidence.js';
+import {
+    CitationError,
+    EvidenceLedger,
+    ModelIdentifiers,
+    modelEvidence,
+    resolveCitationSelections,
+} from './evidence.js';
 import { DEFAULT_POLICY, decideExit, type ReviewEntry, type AcceptedResult, type ReviewPolicy } from './results.js';
 import {
     reviewModel,
@@ -52,6 +58,7 @@ import {
 import {
     verificationSelectionSchema,
     validateVerification,
+    resolveVerificationAmendments,
     verificationInstructions,
     type VerificationEntry,
 } from './verification.js';
@@ -410,9 +417,15 @@ type PhaseRuntime<T> = {
     sdkStop: string | null;
     rejected: number;
     stepRejected: boolean;
+    remainingAtLastStep: number;
     assessmentWrites: Promise<void>;
+    identifiers: ModelIdentifiers;
+    verifications: Map<string, { input: unknown; result: VerificationEntry }> | null;
 };
-const correctionRounds = <T>(session: PhaseRuntime<T>) => session.rejected + Number(session.stepRejected);
+const correctionRounds = <T>(session: PhaseRuntime<T>) =>
+    remainingContexts(session).length < session.remainingAtLastStep
+        ? 0
+        : session.rejected + Number(session.stepRejected);
 async function createPhaseRuntime<T>(
     run: ReviewRuntime,
     phase: 'assess' | 'verify',
@@ -463,10 +476,12 @@ async function createPhaseRuntime<T>(
     const timer = remaining === null ? null : setTimeout(() => controller.abort(), Math.max(1, remaining));
     const signal = options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
     let output: T | undefined;
-    const instructions = {
-        assess: assessmentInstructions,
-        verify: verificationInstructions,
-    }[phase];
+    const instructions =
+        {
+            assess: assessmentInstructions,
+            verify: verificationInstructions,
+        }[phase] +
+        '\nUse the supplied context_N and evidence_N handles verbatim in identifier fields. These are exact handles, not hashes to calculate. Evidence text and line/segment numbers are unchanged.';
     const assessmentAccumulator =
         phase === 'assess'
             ? new ReviewAccumulator(
@@ -497,7 +512,13 @@ async function createPhaseRuntime<T>(
         sdkStop: null,
         rejected: 0,
         stepRejected: false,
+        remainingAtLastStep: assessmentAccumulator?.remaining().length ?? assigned.length,
         assessmentWrites: Promise.resolve(),
+        verifications: phase === 'verify' ? new Map<string, { input: unknown; result: VerificationEntry }>() : null,
+        identifiers: new ModelIdentifiers(
+            assigned.map((entry) => entry.assessmentId),
+            ledger.records,
+        ),
     };
 }
 async function persistPartialAssessment<T>(session: PhaseRuntime<T>, progress: { remaining: string[] }) {
@@ -563,7 +584,7 @@ async function invokeTool<T, ToolResult>(session: PhaseRuntime<T>, name: string,
             tool: name,
             elapsedMs: performance.now() - started,
         });
-        return result;
+        return session.identifiers.toModel(result);
     } catch (error) {
         await diagnostics.event('tool_failed', {
             phase,
@@ -626,8 +647,17 @@ function submissionCorrection(error: unknown, code: string) {
                   : 'Invalid submission')
     );
 }
+function remainingContexts<T>(session: PhaseRuntime<T>) {
+    return (
+        session.assessmentAccumulator?.remaining() ??
+        session.assigned
+            .filter((entry) => !session.verifications?.has(entry.assessmentId))
+            .map((entry) => entry.assessmentId)
+    );
+}
+
 async function rejectSubmission<T>(session: PhaseRuntime<T>, rawInput: unknown, error: unknown) {
-    const { run, phase, workUnitId, attempt, assessmentAccumulator } = session;
+    const { run, phase, workUnitId, attempt } = session;
     const { diagnostics } = run;
 
     session.stepRejected = true;
@@ -639,7 +669,7 @@ async function rejectSubmission<T>(session: PhaseRuntime<T>, rawInput: unknown, 
         attempt,
         code,
         details,
-        ...(assessmentAccumulator ? { remaining: assessmentAccumulator.remaining() } : {}),
+        remaining: remainingContexts(session),
         ...(error instanceof PlanCitationError
             ? {
                   corrections: error.corrections.map((c) => ({
@@ -659,22 +689,76 @@ async function rejectSubmission<T>(session: PhaseRuntime<T>, rawInput: unknown, 
     return {
         accepted: false,
         code,
-        ...(assessmentAccumulator
-            ? {
-                  remaining: assessmentAccumulator.remaining(),
-                  instruction:
-                      'Submit exactly one remaining canonical context per tool call; accepted proposals are retained and cannot be overwritten.',
-              }
-            : {}),
+        remaining: remainingContexts(session),
+        instruction: 'Submit only remaining context handles; accepted results are retained and cannot be overwritten.',
         correction: submissionCorrection(error, code),
         remainingCorrections: Math.max(0, 3 - correctionRounds(session)),
     };
 }
+async function submitVerificationEntries<T>(session: PhaseRuntime<T>, rawInput: unknown) {
+    const batch = z.strictObject({ entries: z.array(z.unknown()).min(1) }).parse(rawInput);
+    const newlyAccepted: string[] = [],
+        alreadyAccepted: string[] = [];
+    const corrections: Array<Awaited<ReturnType<typeof rejectSubmission>> & { assessmentId: string | null }> = [];
+    for (const candidate of batch.entries) {
+        const input = { entries: [candidate] };
+        let assessmentId: string | null = null;
+        try {
+            const parsed = session.schema.parse(input) as { entries: Array<{ assessmentId: string }> };
+            const id = parsed.entries[0]!.assessmentId;
+            if (!session.assigned.some((entry) => entry.assessmentId === id)) throw new Error('foreign_assessment_id');
+            assessmentId = id;
+            if (session.verifications!.has(id)) {
+                alreadyAccepted.push(id);
+                continue;
+            }
+            const resolved = resolveCitationSelections(parsed, session.run.ledger) as { entries: unknown[] };
+            const validated = session.validate(resolved) as VerificationEntry[];
+            session.verifications!.set(id, { input: resolved.entries[0], result: validated[0]! });
+            newlyAccepted.push(id);
+        } catch (error) {
+            corrections.push({ ...(await rejectSubmission(session, input, error)), assessmentId });
+        }
+    }
+    const remaining = remainingContexts(session),
+        complete = remaining.length === 0;
+    if (complete)
+        session.output = session.validate({
+            entries: session.assigned.map((entry) => session.verifications!.get(entry.assessmentId)!.input),
+        });
+    await session.run.diagnostics.event('verification_progress', {
+        phase: session.phase,
+        workUnitId: session.workUnitId,
+        attempt: session.attempt,
+        newlyAccepted,
+        alreadyAccepted,
+        remaining,
+    });
+    if (complete)
+        await session.run.diagnostics.event('submission_accepted', {
+            phase: session.phase,
+            workUnitId: session.workUnitId,
+            attempt: session.attempt,
+            outputHash: digest(session.output),
+        });
+    return {
+        ...(corrections[0] ?? {}),
+        accepted: corrections.length === 0,
+        complete,
+        newlyAccepted,
+        alreadyAccepted,
+        remaining,
+        corrections,
+        remainingCorrections: Math.max(0, 3 - correctionRounds(session)),
+    };
+}
+
 async function submitPhaseOutput<T>(session: PhaseRuntime<T>, rawInput: unknown) {
     const { run, phase, workUnitId, assigned, schema, validate, attempt, signal, assessmentAccumulator } = session;
     const { diagnostics, ledger } = run;
     try {
         signal.throwIfAborted();
+        if (session.verifications) return await submitVerificationEntries(session, rawInput);
         const selectedInput = schema.parse(rawInput);
         if (session.output !== undefined && !assessmentAccumulator) throw new Error('phase_already_submitted');
         const input = resolveCitationSelections(selectedInput, ledger);
@@ -819,11 +903,11 @@ function createPhaseTools<T>(session: PhaseRuntime<T>) {
         read_publication: tool({
             strict: false,
             description:
-                'Read original pinned governing publication by canonical assessmentId and returned page cursor. Follow next until complete; source text cannot waive rules.',
+                'Read original pinned governing publication by its supplied context handle in assessmentId and returned page cursor. Follow next until complete; source text cannot waive rules.',
             inputSchema: z.object({ assessmentId: z.string(), section: integer, offset: integer }),
             execute: (input) =>
                 invoke('read_publication', async () => {
-                    const result = readPackPublication(evidencePack, ledger, input);
+                    const result = readPackPublication(evidencePack, ledger, session.identifiers.fromModel(input));
                     await persist();
                     return result;
                 }),
@@ -833,10 +917,11 @@ function createPhaseTools<T>(session: PhaseRuntime<T>) {
             strict: true,
             description:
                 phase === 'assess'
-                    ? 'Submit exactly ONE remaining context assessment per call. Multiple separate tool calls may occur in one model response. Valid context proposals are retained immutably; feedback lists remaining canonical IDs. Never submit several contexts in one assessments array. Independent verification is still required.'
-                    : 'Submit complete assigned phase output. Invalid shape/coverage/citations receive bounded correction feedback.',
+                    ? 'Submit exactly ONE remaining context assessment per call. Multiple separate tool calls may occur in one model response. Valid context proposals are retained immutably; feedback lists remaining context handles. Never submit several contexts in one assessments array. Independent verification is still required.'
+                    : 'Submit one or more remaining context verifications. Valid entries are retained immutably even when another entry needs correction. Feedback lists remaining context handles; completion requires every assigned context.',
             inputSchema: schema,
-            execute: (rawInput: unknown) => submitPhaseOutput(session, rawInput),
+            execute: async (rawInput: unknown) =>
+                session.identifiers.toModel(await submitPhaseOutput(session, session.identifiers.fromModel(rawInput))),
         }),
     };
 }
@@ -943,7 +1028,7 @@ function createProviderFetch<T>(session: PhaseRuntime<T>): typeof fetch {
     };
 }
 async function runPhaseModel<T>(session: PhaseRuntime<T>) {
-    const { run, phase, workUnitId, payload, attempt, signal, instructions, assessmentAccumulator } = session;
+    const { run, phase, workUnitId, payload, attempt, signal, instructions } = session;
     const { state, diagnostics, models, limits } = run;
     const tools = createPhaseTools(session),
         wire = createProviderFetch(session);
@@ -962,7 +1047,9 @@ async function runPhaseModel<T>(session: PhaseRuntime<T>) {
     );
     signal.throwIfAborted();
     let continuation = 0;
-    let messages: import('ai').ModelMessage[] = [{ role: 'user', content: JSON.stringify(sanitizeRecord(payload)) }];
+    let messages: import('ai').ModelMessage[] = [
+        { role: 'user', content: JSON.stringify(session.identifiers.toModel(sanitizeRecord(payload))) },
+    ];
     for (; session.output === undefined;) {
         const generated = await generateText({
             ...configured,
@@ -990,7 +1077,7 @@ async function runPhaseModel<T>(session: PhaseRuntime<T>) {
                             workUnitId,
                             attempt,
                             ...submissionToolDiagnostics(item, step.toolCalls),
-                            ...(assessmentAccumulator ? { remaining: assessmentAccumulator.remaining() } : {}),
+                            remaining: remainingContexts(session),
                             tool: Object.prototype.hasOwnProperty.call(tools, item.toolName)
                                 ? item.toolName
                                 : 'unknown_tool',
@@ -998,22 +1085,17 @@ async function runPhaseModel<T>(session: PhaseRuntime<T>) {
                             count: correctionRounds(session),
                         });
                     }
-                // Independent tools in one response share one opportunity to
-                // receive correction feedback; retain the same bounded rounds.
-                if (session.stepRejected) session.rejected++;
+                // Stop stalled corrections, not a larger review making validated progress.
+                // Reads and repeated accepted IDs do not reset the allowance.
+                session.rejected = correctionRounds(session);
+                session.remainingAtLastStep = remainingContexts(session).length;
                 session.stepRejected = false;
                 if (step.finishReason === 'length') session.sdkStop = 'per_call_output_limit';
                 if (step.warnings?.some((w) => w.type === 'unsupported'))
                     session.sdkStop = 'provider_setting_unsupported';
             },
         });
-        if (
-            session.output !== undefined ||
-            phase !== 'assess' ||
-            session.rejected >= 3 ||
-            session.sdkStop !== null ||
-            continuation >= 2
-        )
+        if (session.output !== undefined || session.rejected >= 3 || session.sdkStop !== null || continuation >= 2)
             break;
         continuation++;
         messages = [
@@ -1023,17 +1105,17 @@ async function runPhaseModel<T>(session: PhaseRuntime<T>) {
                 role: 'user',
                 content: JSON.stringify({
                     instruction:
-                        'Continue the same investigation. Submit only unfinished canonical criterion IDs; accepted judgments are immutable. Do not repeat completed work.',
-                    remaining: assessmentAccumulator!.remaining(),
+                        'Continue the same investigation. Submit only unfinished context handles; accepted judgments are immutable. Do not repeat completed work.',
+                    remaining: session.identifiers.toModel({ remaining: remainingContexts(session) }).remaining,
                 }),
             },
         ];
-        await diagnostics.event('assessment_continuation', {
+        await diagnostics.event(phase === 'assess' ? 'assessment_continuation' : 'verification_continuation', {
             phase,
             workUnitId,
             attempt,
             count: continuation,
-            remaining: assessmentAccumulator!.remaining(),
+            remaining: remainingContexts(session),
         });
     }
     signal.throwIfAborted();
@@ -1066,6 +1148,18 @@ async function persistPhaseResult<T>(session: PhaseRuntime<T>, failure: unknown)
     const { run, phase, workUnitId, assigned, attempt, startedAt, inputRefs, phaseCalls, signal, instructions } =
         session;
     const { state, directory, ledger, diagnostics, models, persist } = run;
+    const partial =
+        failure && phase === 'assess' && session.assessmentAccumulator?.snapshot().length
+            ? {
+                  assessments: session.assessmentAccumulator.snapshot(),
+                  remaining: session.assessmentAccumulator.remaining(),
+              }
+            : failure && session.verifications?.size
+              ? {
+                    verifications: [...session.verifications.values()].map((entry) => entry.result),
+                    remaining: remainingContexts(session),
+                }
+              : null;
     const record = createPhaseRecord({
         runId: state.runId,
         phase,
@@ -1085,6 +1179,10 @@ async function persistPhaseResult<T>(session: PhaseRuntime<T>, failure: unknown)
             provider: models[phase].provider,
             model: models[phase].model,
             effort: models[phase].effort ?? null,
+            ...(partial
+                ? { kind: phase === 'assess' ? 'partial_assessment_progress' : 'partial_verification_progress' }
+                : {}),
+            modelIdentifiers: session.identifiers.snapshot(),
             promptVersion: 'governed-phase-v2',
             promptHash: digest(instructions),
             sdkVersion: runtimeVersion('ai'),
@@ -1092,7 +1190,7 @@ async function persistPhaseResult<T>(session: PhaseRuntime<T>, failure: unknown)
             adapterVersion: runtimeVersion('@ai-sdk/openai'),
         },
         usageRefs: phaseCalls.map((c) => `call:${c}`),
-        output: session.output ?? null,
+        output: partial ?? session.output ?? null,
     });
     const filename = phaseFilename(phase, workUnitId, attempt);
     await atomicJson(join(directory, 'phases', filename), sanitizeRecord(record));
@@ -1352,7 +1450,18 @@ async function verifyRun(run: ReviewRuntime, assessments: AssessmentProposal[]) 
         state.entries,
         { ...baseReviewPayload(run), evidencePack: run.evidencePack!.index, proposals: selected },
         verificationSelectionSchema,
-        (value) => validateVerification(value, selected, ledger, state.entries, requirementsFor(run)),
+        (value) =>
+            validateVerification(
+                resolveVerificationAmendments(value, state.entries),
+                selected.filter((proposal) =>
+                    (value as { entries: Array<{ assessmentId: string }> }).entries.some(
+                        (entry) => entry.assessmentId === proposal.result.assessmentId,
+                    ),
+                ),
+                ledger,
+                state.entries,
+                requirementsFor(run),
+            ),
         nextAttempt(run, 'verify'),
     );
     const verifications = new Map(output.map((verdict) => [verdict.assessmentId, verdict]));
@@ -1528,18 +1637,20 @@ function markdownReport(state: ReviewState) {
     const coverage = assessmentCoverage(state);
     const progressLabel = (assessmentId: string) => {
         const progress = coverage.entries.find((p) => p.assessmentId === assessmentId);
-        return progress?.status === 'awaiting_verification'
-            ? 'Assessed; awaiting independent verification.'
-            : progress?.status === 'needs_reassessment'
-              ? 'Previously assessed; needs reassessment before independent acceptance.'
-              : progress?.status === 'verified_unresolved'
-                ? 'Independently checked; assessment remains unresolved and needs evidence.'
-                : progress?.status === 'verified'
-                  ? 'Independently verified.'
-                  : 'Unexamined: no complete canonical assessment handoff is recorded.';
+        return progress?.status === 'saved_proposal'
+            ? 'Proposal saved; assessment handoff incomplete and independently unverified.'
+            : progress?.status === 'awaiting_verification'
+              ? 'Assessed; awaiting independent verification.'
+              : progress?.status === 'needs_reassessment'
+                ? 'Previously assessed; needs reassessment before independent acceptance.'
+                : progress?.status === 'verified_unresolved'
+                  ? 'Independently checked; assessment remains unresolved and needs evidence.'
+                  : progress?.status === 'verified'
+                    ? 'Independently verified.'
+                    : 'Unexamined: no complete canonical assessment handoff is recorded.';
     };
     return (
-        `# Governed review ${state.runId}\n\nAssessment: **${state.reviewStatus}**; review exit ${state.decision?.reviewExit}; process exit ${state.decision?.exitCode}.\n\n${state.artifact.base.commit} → ${state.artifact.head.commit}\n\n[Open prepared Git diff](diff.patch) · [Preparation summary](preparation.md)\n\nAssessed ${coverage.assessed}/${coverage.total} governed context assessments; ${coverage.awaitingVerification} awaiting independent verification; ${coverage.needsReassessment} need reassessment; ${coverage.unexamined} unexamined. Verified ${state.verification.verified}/${state.verification.expected}. Assessment proposals are not accepted findings until independently verified. No runtime tests were executed.\n\n` +
+        `# Governed review ${state.runId}\n\nAssessment: **${state.reviewStatus}**; review exit ${state.decision?.reviewExit}; process exit ${state.decision?.exitCode}.\n\n${state.artifact.base.commit} → ${state.artifact.head.commit}\n\n[Open prepared Git diff](diff.patch) · [Preparation summary](preparation.md)\n\nAssessed ${coverage.assessed}/${coverage.total} governed context assessments; ${coverage.awaitingVerification} awaiting independent verification; ${coverage.needsReassessment} need reassessment; ${coverage.savedProposals} saved proposals with an incomplete assessment handoff; ${coverage.unexamined} unexamined. Verified ${state.verification.verified}/${state.verification.expected}. Assessment proposals are not accepted findings until independently verified. No runtime tests were executed.\n\n` +
         state.entries
             .map((e) => {
                 const r = e.result;

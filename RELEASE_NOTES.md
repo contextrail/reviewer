@@ -1,6 +1,6 @@
-## 1.0.0-alpha.12 (2026-11-03)
+## 1.0.0-alpha.14 (2026-11-04)
 
 ### Fixes and improvements
 
-* **reviewer:** fix the verfication schema 0bc7946
+* **reviewer:** retry public export after GitHub failure 517239a
 

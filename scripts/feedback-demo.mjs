@@ -87,17 +87,11 @@ try {
                             {
                                 result: {
                                     assessmentId: entry.assessmentId,
-                                    revisionOf: null,
                                     disposition: 'evaluated',
-                                    adherence: 2,
                                     confidence: 3,
                                     confidenceReason: 'SENTINEL_LOCAL_CONFIDENCE_C5',
-                                    finding: 'none',
                                     explanation: 'SENTINEL_LOCAL_EXPLANATION_C5',
-                                    consequence: '',
-                                    correction: '',
                                     limitations: ['SENTINEL_LOCAL_LIMITATION_C5'],
-                                    citations: [cite(source), cite(contextFor(entry))],
                                 },
                                 checks: [
                                     {
@@ -126,7 +120,6 @@ try {
                                 reason: 'SENTINEL_LOCAL_VERIFICATION_C5',
                                 citations: [cite(source), cite(contextFor(entry))],
                                 missingChecks: [],
-                                resolution: null,
                                 amendment: null,
                                 findings: [],
                             })),

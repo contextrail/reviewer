@@ -16,6 +16,17 @@ export const resultSchema = z.strictObject({
     limitations: z.array(z.string()),
     citations: z.array(citationSchema),
 });
+/** Models judge applicability and confidence; code derives aggregate outcomes from finding accounts. */
+export function modelResultSchema() {
+    return resultSchema.pick({
+        assessmentId: true,
+        disposition: true,
+        confidence: true,
+        confidenceReason: true,
+        explanation: true,
+        limitations: true,
+    });
+}
 export type AcceptedResult = Omit<z.infer<typeof resultSchema>, 'citations'> & {
     citations: Citation[];
     revision: number;

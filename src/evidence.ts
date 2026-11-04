@@ -75,6 +75,89 @@ export function modelEvidence(record: Evidence) {
         segments: evidenceSegments(record.text).map(({ index, text }) => ({ index, text })),
     };
 }
+/** Model-only handles and compact metadata; the ledger and audit artifacts stay canonical. */
+export class ModelIdentifiers {
+    private readonly handles = new Map<string, string>();
+    private readonly canonical = new Map<string, string>();
+    private evidenceCount = 0;
+
+    constructor(
+        assessmentIds: string[],
+        private readonly evidence: Record<string, unknown>,
+    ) {
+        assessmentIds.forEach((id, index) => this.register(id, `context_${index + 1}`));
+        Object.keys(evidence)
+            .sort()
+            .forEach((ref) => this.evidenceHandle(ref));
+    }
+
+    private register(id: string, handle: string) {
+        this.handles.set(id, handle);
+        this.canonical.set(handle, id);
+        return handle;
+    }
+
+    private evidenceHandle(ref: string) {
+        return this.handles.get(ref) ?? this.register(ref, `evidence_${++this.evidenceCount}`);
+    }
+
+    private translate(value: unknown, outward: boolean, field = ''): unknown {
+        if (Array.isArray(value)) return value.map((item) => this.translate(item, outward, field));
+        if (value && typeof value === 'object') {
+            const citation =
+                outward &&
+                'ref' in value &&
+                typeof value.ref === 'string' &&
+                Object.hasOwn(this.evidence, value.ref) &&
+                'quote' in value &&
+                typeof value.quote === 'string';
+            const result =
+                outward &&
+                'assessmentId' in value &&
+                typeof value.assessmentId === 'string' &&
+                this.handles.has(value.assessmentId) &&
+                'disposition' in value &&
+                'adherence' in value;
+            return Object.fromEntries(
+                Object.entries(value)
+                    .filter(
+                        ([key]) =>
+                            (!citation || !['quote', 'start', 'end'].includes(key)) &&
+                            (!result || !['revision', 'revisionOf'].includes(key)),
+                    )
+                    .map(([key, item]) => [key, this.translate(item, outward, key)]),
+            );
+        }
+        if (typeof value !== 'string' || !MODEL_IDENTIFIER_FIELDS.has(field)) return value;
+        if (!outward) return this.canonical.get(value) ?? value;
+        if (Object.hasOwn(this.evidence, value)) return this.evidenceHandle(value);
+        return this.handles.get(value) ?? value;
+    }
+
+    toModel<T>(value: T): T {
+        return this.translate(value, true) as T;
+    }
+
+    /** Audit-only identity map; never includes the source text behind an evidence reference. */
+    snapshot(): Record<string, string> {
+        return Object.fromEntries(this.canonical);
+    }
+
+    fromModel<T>(value: T): T {
+        return this.translate(value, false) as T;
+    }
+}
+const MODEL_IDENTIFIER_FIELDS = new Set([
+    'assessmentId',
+    'assessmentIds',
+    'remaining',
+    'newlyAccepted',
+    'alreadyAccepted',
+    'ref',
+    'allowedRefs',
+    'evidenceRefs',
+]);
+
 const MAX_SELECTION_BYTES = 64 * 1024;
 export const MAX_SUBMISSION_QUOTE_BYTES = 1024 * 1024;
 function parseSelection(input: unknown, path: Array<string | number>) {

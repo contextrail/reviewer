@@ -65,7 +65,7 @@ unresolved; rejected findings stay in the audit handoff rather than the publishe
 Missing decisive checks remain unresolved. Their current explanation, correction and citations come
 from verification, without retaining contradictory proposal text. A supported blocking finding still
 blocks while completeness is reported separately. No additional assessor/verifier loop is introduced.
-For missed defects or incorrect classifications, the verifier can submit a complete amended criterion
+For corrected conclusions, missed defects or incorrect classifications, the verifier submits a complete amended criterion
 assessment with governing checks, source evidence and the final finding list. The amendment supersedes
 the original criterion's findings, so it must retain all still-supported findings. Both versions remain
 in their immutable phase records. The existing assessment validator checks its scope, citations,
@@ -76,6 +76,17 @@ Model citations select `{ref, startSegment, endSegment}` from numbered evidence 
 using inclusive indices relative to that evidence record. Code extracts the exact quotation,
 character offsets and source location; models do not supply quotation text. An explicit range
 also identifies an occurrence when text repeats. Canonical reports retain quotations and provenance.
+Within each model session, short `context_N` and `evidence_N` handles identify the assigned
+contexts and available evidence. Exact lookup restores canonical identities before validation;
+unknown handles remain invalid. Audit artifacts retain canonical identities. Assessment result
+citations are derived from the checks' governing passages and source references, so the model
+does not have to repeat the same evidence in a separate result field.
+Model inputs carry citation references and source/publication locations rather than repeated report
+quotations; the full original evidence remains available through the read tools. Code supplies revision
+metadata from the current context state. The verifier uses one complete amendment path for corrections.
+The model supplies checks, concrete findings and confidence. Code derives the aggregate finding,
+adherence, consequence and correction from those accounts, rather than asking for a second verdict.
+Canonical validators still check evidence, authority and consistency with findings.
 Selection failures identify the precise field and safe evidence identity in correction feedback
 and diagnostics. Source bodies stay out of routine diagnostics. Selection bounds, exact text,
 governing authority and independent verification remain enforced without extra correction rounds.
@@ -86,8 +97,15 @@ The assessment session submits one complete context result at a time. The packag
 result and reports the remaining context IDs; corrections cannot overwrite an accepted result. The
 phase completes only when every assigned context is present. Retained partial progress is evidence
 of an incomplete phase, never a verified assessment or a successful review.
+Reports count these saved proposals separately from complete assessment handoffs and independently
+verified results, rather than describing retained work as unexamined.
+Verification also retains valid context judgments within its single session. A batch with a semantic
+or citation error preserves valid sibling entries and reports which contexts still need correction.
+Completion requires every assigned context and a final whole-set validation. Failed verification
+records retain partial progress for audit; resuming starts independent verification afresh.
 Invalid submissions in one model response share a correction round; the session stops after three
-invalid rounds. Every attempt consumes the global execution budget. Use one exact committed file
+invalid rounds without newly accepted context judgments. Validated progress resets that allowance;
+reads and duplicate submissions do not. Every attempt still consumes the global execution budget. Use one exact committed file
 for scoped literal search, or omit the path for bounded whole-tree navigation.
 
 Provider recovery allows at most two additional attempts per failed request, with 250ms then 500ms

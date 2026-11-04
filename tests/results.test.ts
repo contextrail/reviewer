@@ -1,5 +1,13 @@
-import { reconcileFindings, type ReviewFinding } from '../src/assessment.js';
+import {
+    deriveAssessmentCitations,
+    validateReviewSubmission,
+    reviewSelectionSchema,
+    reconcileFindings,
+    type ReviewFinding,
+} from '../src/assessment.js';
 import { describe, expect, it } from 'vitest';
+import { z } from 'zod';
+import { validateVerification, verificationSchema, verificationSelectionSchema } from '../src/verification.js';
 import { reportedUsage } from '../src/providers.js';
 import {
     CitationError,
@@ -10,8 +18,9 @@ import {
     resolveCitationSelections,
     MAX_SUBMISSION_QUOTE_BYTES,
 } from '../src/evidence.js';
-import { DEFAULT_POLICY, decideExit, validateResult, type ReviewEntry } from '../src/results.js';
+import { modelResultSchema, DEFAULT_POLICY, decideExit, validateResult, type ReviewEntry } from '../src/results.js';
 import type { Publication } from '../src/contracts.js';
+import { digest } from '../src/prepare.js';
 
 const publication: Publication = {
     nodeId: 'context://engineering/rule',
@@ -459,5 +468,277 @@ describe('code-owned quotations from evidence-relative segments', () => {
         }
         expect(failure).toBeInstanceOf(CitationError);
         expect(failure).toMatchObject({ code: 'citation_range_invalid', path: ['citations', 16, 'endSegment'] });
+    });
+});
+
+function modelJudgment() {
+    const { assessmentId, disposition, confidence, confidenceReason, explanation, limitations } = fixture().input;
+    return { assessmentId, disposition, confidence, confidenceReason, explanation, limitations };
+}
+function modelAssessmentFixture() {
+    const { input, entries, ledger } = fixture();
+    const result = modelJudgment();
+    const check = {
+        passage: input.citations[0],
+        interpretation: 'Apply governing requirement.',
+        disposition: 'evaluated',
+        explanation: 'Source inspected.',
+        sourceRefs: [input.citations[1]],
+        contraryEvidence: '',
+        missingEvidence: '',
+    };
+    const finding = {
+        classification: 'binding_violation',
+        checkIndices: [0],
+        locationRefs: [input.citations[1]],
+        explanation: 'Observed unmet obligation.',
+        consequence: 'Disclosure.',
+        correction: 'Restore check.',
+        limitations: [],
+        proposedReplacement: null,
+    };
+    return { entries, ledger, result, check, finding };
+}
+describe('minimal model judgment contract', () => {
+    it('asks only for applicability, confidence and an explanation, never aggregate finding claims or protocol metadata', () => {
+        expect(Object.keys(modelJudgment()).sort()).toEqual([
+            'assessmentId',
+            'confidence',
+            'confidenceReason',
+            'disposition',
+            'explanation',
+            'limitations',
+        ]);
+        expect(z.toJSONSchema(modelResultSchema()).type).toBe('object');
+        expect(z.toJSONSchema(verificationSelectionSchema.shape.entries.element).type).toBe('object');
+        for (const disposition of ['evaluated', 'not_applicable', 'unresolved'])
+            for (const confidence of [null, 1, 2, 3])
+                expect(modelResultSchema().safeParse({ ...modelJudgment(), disposition, confidence }).success).toBe(
+                    true,
+                );
+        for (const key of ['adherence', 'finding', 'consequence', 'correction', 'revisionOf', 'citations'])
+            expect(modelResultSchema().safeParse({ ...modelJudgment(), [key]: null }).success).toBe(false);
+    });
+    it('keeps evaluated confidence validation at the canonical boundary', () => {
+        const { result, check, entries, ledger } = modelAssessmentFixture();
+        const model = { ...result, confidence: null };
+        expect(modelResultSchema().safeParse(model).success).toBe(true);
+        const derived = deriveAssessmentCitations(
+            { assessments: [{ result: model, checks: [check], findings: [] }] },
+            entries,
+        );
+        expect(() => validateResult(derived.result, entries, ledger)).toThrow();
+    });
+    it('emits strict all-required model objects', () => {
+        const inspect = (value: unknown): void => {
+            if (!value || typeof value !== 'object') return;
+            const schema = value as Record<string, unknown>;
+            if (schema.type === 'object') {
+                expect(schema.additionalProperties).toBe(false);
+                expect([...(schema.required as string[])].sort()).toEqual(
+                    Object.keys(schema.properties as object).sort(),
+                );
+            }
+            for (const nested of Object.values(schema)) inspect(nested);
+        };
+        for (const schema of [modelResultSchema(), reviewSelectionSchema, verificationSelectionSchema])
+            inspect(z.toJSONSchema(schema));
+    });
+});
+describe('deterministic assessment aggregate', () => {
+    it('produces a clean evaluated outcome from no finding accounts without forcing a dummy finding', () => {
+        const { result, check, entries } = modelAssessmentFixture();
+        const derived = deriveAssessmentCitations(
+            {
+                assessments: [
+                    {
+                        result: { ...result, explanation: 'There is no supported finding.' },
+                        checks: [check],
+                        findings: [],
+                    },
+                ],
+            },
+            entries,
+        );
+        expect(derived.result).toMatchObject({
+            adherence: 2,
+            finding: 'none',
+            consequence: '',
+            correction: '',
+            revisionOf: null,
+        });
+    });
+    it('derives ranked classification and distinct consequences/remedies only from actual accounts', () => {
+        const { result, check, finding, entries } = modelAssessmentFixture();
+        const findings = [
+            {
+                ...finding,
+                classification: 'guidance_departure',
+                consequence: 'Maintainability.',
+                correction: 'Simplify.',
+            },
+            { ...finding, classification: 'behavioral_defect' },
+            finding,
+        ];
+        const derived = deriveAssessmentCitations({ assessments: [{ result, checks: [check], findings }] }, entries);
+        expect(derived.result).toMatchObject({
+            adherence: 0,
+            finding: 'binding_violation',
+            consequence: 'Maintainability.\nDisclosure.',
+            correction: 'Simplify.\nRestore check.',
+        });
+    });
+    it('does not silently discard findings on a nonapplicable judgment', () => {
+        const { result, check, finding, entries, ledger } = modelAssessmentFixture();
+        const derived = deriveAssessmentCitations(
+            {
+                assessments: [
+                    {
+                        result: { ...result, disposition: 'not_applicable', confidence: null },
+                        checks: [check],
+                        findings: [finding],
+                    },
+                ],
+            },
+            entries,
+        );
+        expect(derived.result).toMatchObject({ adherence: null, finding: 'binding_violation' });
+        expect(derived.findings).toHaveLength(1);
+        expect(() => validateResult(derived.result, entries, ledger)).toThrow('Unresolved/nonapplicable judgments');
+    });
+    it('retains known findings separately from an unresolved criterion and normalizes only aggregate confidence', () => {
+        const { result, check, finding, entries, ledger } = modelAssessmentFixture();
+        entries[0]!.contentHash = digest(publication.content);
+        const derived = deriveAssessmentCitations(
+            {
+                assessments: [
+                    {
+                        result: {
+                            ...result,
+                            disposition: 'unresolved',
+                            confidence: 3,
+                            confidenceReason: 'Certain that the external value is unavailable.',
+                        },
+                        checks: [
+                            check,
+                            {
+                                ...check,
+                                interpretation: 'Verify the external package selection.',
+                                disposition: 'unresolved',
+                                missingEvidence: 'Inspect external version value.',
+                            },
+                        ],
+                        findings: [finding],
+                    },
+                ],
+            },
+            entries,
+        );
+        expect(derived.result).toMatchObject({
+            adherence: null,
+            confidence: null,
+            finding: 'none',
+            confidenceReason: 'Certain that the external value is unavailable.',
+            correction: 'Restore check.\nInspect external version value.',
+        });
+        expect(derived.findings).toHaveLength(1);
+        expect(validateReviewSubmission({ assessments: [derived] }, entries, ledger).findings).toHaveLength(1);
+    });
+    it('preserves an unresolved check’s explicit missing evidence as the required follow-up', () => {
+        const { result, check, entries } = modelAssessmentFixture();
+        const derived = deriveAssessmentCitations(
+            {
+                assessments: [
+                    {
+                        result: { ...result, disposition: 'unresolved', confidence: null },
+                        checks: [
+                            {
+                                ...check,
+                                disposition: 'unresolved',
+                                missingEvidence: 'Inspect the actual downstream consumer.',
+                            },
+                        ],
+                        findings: [],
+                    },
+                ],
+            },
+            entries,
+        );
+        expect(derived.result).toMatchObject({
+            adherence: null,
+            finding: 'none',
+            correction: 'Inspect the actual downstream consumer.',
+        });
+    });
+    it('derives the exact current revision for initial and resumed judgments', () => {
+        const { result, check, entries } = modelAssessmentFixture();
+        const input = { assessments: [{ result, checks: [check], findings: [] }] };
+        expect(deriveAssessmentCitations(input, entries).result.revisionOf).toBe(null);
+        const revisedEntries = entries.map((entry) => ({ ...entry, result: { ...entry.result, revision: 7 } }));
+        expect(deriveAssessmentCitations(input, revisedEntries).result.revisionOf).toBe(7);
+        expect(() => deriveAssessmentCitations(input, [])).toThrow('foreign_assessment_id');
+    });
+});
+describe('model verification acceptance contract', () => {
+    const verdict = {
+        assessmentId: 'context_1',
+        disposition: 'accept',
+        reason: 'Evidence supports this assessment.',
+        citations: [],
+        missingChecks: [],
+        amendment: null,
+        findings: [{ findingId: 'finding_1', accepted: true, suggestionAccepted: false, explanation: 'Supported.' }],
+    };
+    it('accepts supported findings without a competing correction or unresolved checks', () => {
+        expect(verificationSelectionSchema.safeParse({ entries: [verdict] }).success).toBe(true);
+    });
+    it.each(['amendment', 'missingChecks', 'rejectedFinding'])(
+        'rejects acceptance with %s at the canonical boundary',
+        (field) => {
+            const { result, check, finding, entries, ledger } = modelAssessmentFixture();
+            entries[0]!.contentHash = digest(publication.content);
+            const assessment = deriveAssessmentCitations(
+                { assessments: [{ result, checks: [check], findings: [finding] }] },
+                entries,
+            );
+            const proposal = validateReviewSubmission({ assessments: [assessment] }, entries, ledger);
+            const candidate = {
+                ...verdict,
+                assessmentId: result.assessmentId,
+                resolution: null,
+                citations: [check.passage, ...check.sourceRefs],
+                findings: [
+                    {
+                        ...verdict.findings[0],
+                        findingId: proposal.findings[0]!.findingId,
+                        accepted: field !== 'rejectedFinding',
+                    },
+                ],
+                missingChecks: field === 'missingChecks' ? ['Inspect another surface.'] : [],
+                amendment: field === 'amendment' ? assessment : null,
+            };
+            expect(() => validateVerification({ entries: [candidate] }, [proposal], ledger, entries)).toThrow(
+                field === 'amendment' ? 'verification_amendment_inconsistent' : 'verification_acceptance_inconsistent',
+            );
+        },
+    );
+    it('rejects the obsolete model resolution field while canonical records still accept it', () => {
+        const input = { entries: [{ ...verdict, disposition: 'revise', resolution: fixture().input }] };
+        expect(verificationSchema.safeParse(input).success).toBe(true);
+        expect(verificationSelectionSchema.safeParse(input).success).toBe(false);
+    });
+    it('retains nonacceptance with unresolved checks and rejected findings', () => {
+        expect(
+            verificationSelectionSchema.safeParse({
+                entries: [
+                    {
+                        ...verdict,
+                        disposition: 'unresolved',
+                        missingChecks: ['Inspect another surface.'],
+                        findings: [{ ...verdict.findings[0], accepted: false }],
+                    },
+                ],
+            }).success,
+        ).toBe(true);
     });
 });

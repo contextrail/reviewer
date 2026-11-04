@@ -156,7 +156,7 @@ export const reviewReportInputSchema = z
                     issue();
             } else if (
                 o.adherence !== null ||
-                o.finding !== 'none' ||
+                (o.disposition !== 'unresolved' && o.finding !== 'none') ||
                 (o.disposition !== 'not_applicable' && o.confidence !== null)
             )
                 issue();
@@ -166,10 +166,12 @@ export const reviewReportInputSchema = z
                 const assured = p.minConfidence === null || (o.confidence !== null && o.confidence >= p.minConfidence);
                 const blocking =
                     !p.advisory &&
-                    assured &&
-                    o.disposition === 'evaluated' &&
-                    (['binding_violation', 'behavioral_defect'].includes(o.finding) ||
-                        (p.minAdherence !== null && o.adherence !== null && o.adherence < p.minAdherence));
+                    ((o.disposition === 'unresolved' &&
+                        ['binding_violation', 'behavioral_defect'].includes(o.finding)) ||
+                        (assured &&
+                            o.disposition === 'evaluated' &&
+                            (['binding_violation', 'behavioral_defect'].includes(o.finding) ||
+                                (p.minAdherence !== null && o.adherence !== null && o.adherence < p.minAdherence))));
                 if (o.blocking !== blocking) issue();
             }
         }

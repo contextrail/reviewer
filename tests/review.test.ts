@@ -1,5 +1,5 @@
 import { PlanCitationError, validatePlan } from '../src/planning.js';
-import { EvidenceLedger } from '../src/evidence.js';
+import { ModelIdentifiers, EvidenceLedger } from '../src/evidence.js';
 import { buildInlineReview, validatePublicationArtifacts } from '../src/github.js';
 import type { z } from 'zod';
 import type { assessmentSchema } from '../src/assessment.js';
@@ -241,14 +241,17 @@ type WireRequest = {
     input: unknown;
 };
 type FixturePrepared = Awaited<ReturnType<typeof preparedFixture>>;
-function phaseRequest(body: WireRequest, _prepared: FixturePrepared) {
+function phaseRequest(body: WireRequest, prepared: FixturePrepared) {
     const names = body.tools.map((t) => t.function?.name ?? t.name);
     const phase = names.includes('submit_plan') ? 'plan' : names.includes('submit_assessments') ? 'assess' : 'verify';
     const messages =
         body.messages ?? (body.input as Array<{ role?: string; content: string | Array<{ text?: string }> }>);
     const user = messages.find((message) => message.role === 'user')!;
     const text = typeof user.content === 'string' ? user.content : user.content.find((part) => part.text)?.text!;
-    const payload = JSON.parse(text) as {
+    const payload = new ModelIdentifiers(
+        prepared.state.entries.map((entry) => entry.assessmentId),
+        Object.fromEntries(records(prepared).map((record) => [record.ref, record])),
+    ).fromModel(JSON.parse(text)) as {
         expectedChecklist?: Array<{ assessmentId: string }>;
         plan?: Array<{ assessmentId: string }>;
         proposals?: AssessmentProposal[];
@@ -275,6 +278,24 @@ function modelSelectors(input: unknown, prepared: FixturePrepared): unknown {
     if (Array.isArray(input)) return input.map((value) => modelSelectors(value, prepared));
     if (!input || typeof input !== 'object') return input;
     const value = input as Record<string, unknown>;
+    if (value.resolution === null && 'amendment' in value) {
+        const { resolution: _resolution, ...verdict } = value;
+        return modelSelectors(verdict, prepared);
+    }
+    if (value.result && Array.isArray(value.checks)) {
+        const {
+            citations: _citations,
+            revisionOf: _revisionOf,
+            adherence: _adherence,
+            finding: _finding,
+            consequence: _consequence,
+            correction: _correction,
+            ...result
+        } = value.result as Record<string, unknown>;
+        return Object.fromEntries(
+            Object.entries({ ...value, result }).map(([key, child]) => [key, modelSelectors(child, prepared)]),
+        );
+    }
     if (typeof value.ref === 'string' && typeof value.quote === 'string') {
         const record = records(prepared).find((record) => record.ref === value.ref);
         if (!record) return { ref: value.ref, startSegment: 1, endSegment: 1 };
@@ -410,7 +431,7 @@ function verificationInput(prepared: FixturePrepared, unit = 'all', attempt = 1,
                     const v = c as { ref: string; quote: string; start?: number; end?: number };
                     return {
                         ref: v.ref,
-                        quote: v.quote,
+                        quote: v.quote ?? records(prepared).find((record) => record.ref === v.ref)!.text,
                         ...(!supplied || v.start === undefined ? {} : { start: v.start, end: v.end }),
                     };
                 }),
@@ -432,6 +453,7 @@ function fixtureWire(
     provider: ReviewProvider = 'openrouter',
     opts: {
         separate?: boolean;
+        shortHandles?: boolean;
         units?: string[];
         mutate?: (phase: string, payload: WireSubmission, n: number) => void;
         request?: (body: WireRequest) => void | Promise<void>;
@@ -439,10 +461,21 @@ function fixtureWire(
 ) {
     let call = 0;
     const counts: Record<string, number> = {};
+    const handles = new Map<string, ModelIdentifiers>();
+    const knownEvidence: Record<string, unknown> = {};
     return async (_url: unknown, init?: RequestInit) => {
         const body = JSON.parse(init!.body as string);
         await opts.request?.(body);
         const { phase, ids, unit, attempt, payload: requestPayload } = phaseRequest(body, prepared);
+        Object.assign(knownEvidence, Object.fromEntries(records(prepared).map((record) => [record.ref, record])));
+        if (opts.shortHandles && !handles.has(phase))
+            handles.set(
+                phase,
+                new ModelIdentifiers(
+                    prepared.state.entries.map((entry) => entry.assessmentId),
+                    knownEvidence,
+                ),
+            );
         if (phase === 'assess' && !records(prepared).some((r) => r.provenance.kind === 'source'))
             return response(provider, [{ name: 'read_source', input: { side: 'head', path: 'route.ts' } }], call++);
         const n = (counts[phase + unit] = (counts[phase + unit] ?? 0) + 1);
@@ -470,7 +503,15 @@ function fixtureWire(
                 : [{ name: phase === 'plan' ? 'submit_plan' : 'submit_verification', input: payload }];
         return response(
             provider,
-            calls.map((call) => ({ ...call, input: modelSelectors(call.input, prepared) })),
+            calls.map((call) => {
+                const input = modelSelectors(call.input, prepared);
+                const presented = handles.get(phase)?.toModel(input) ?? input;
+                if (opts.shortHandles) {
+                    expect(JSON.stringify(presented)).not.toContain('assessment:');
+                    expect(JSON.stringify(presented)).not.toContain('evidence:');
+                }
+                return { ...call, input: presented };
+            }),
             call++,
         );
     };
@@ -722,8 +763,8 @@ describe('precise citation correction feedback', () => {
             const prepared = await preparedFixture();
             const expectedPath =
                 targetPhase === 'assess'
-                    ? ['assessments', 0, 'result', 'citations', 1, 'startSegment']
-                    : ['entries', 1, 'citations', 1, 'startSegment'];
+                    ? ['assessments', 0, 'checks', 0, 'sourceRefs', 0, 'startSegment']
+                    : ['entries', 0, 'citations', 1, 'startSegment'];
             let correction:
                 | {
                       message: string;
@@ -745,11 +786,13 @@ describe('precise citation correction feedback', () => {
                             if (output.code !== 'citation_range_invalid') continue;
                             correction = output.correction;
                             expect(correction).toMatchObject({ path: expectedPath });
-                            expect(correction!.ref).toMatch(/^evidence:[a-f0-9]{64}$/u);
-                            expect(correction!.refHash).toBe(digest(correction!.ref));
+                            expect(correction!.ref).toMatch(/^evidence_\d+$/u);
+                            expect(records(prepared).some((record) => digest(record.ref) === correction!.refHash)).toBe(
+                                true,
+                            );
                             expect(correction!.instruction).toContain('startSegment');
                             expect(JSON.stringify(correction)).not.toContain('PRIVATE_REJECTED_SDK_QUOTE');
-                            expect(output.remainingCorrections).toBe(2);
+                            expect(output.remainingCorrections).toBe(3);
                         }
                     },
                     mutate(phase, payload, call) {
@@ -762,7 +805,7 @@ describe('precise citation correction feedback', () => {
                         if (call === firstSubmission) {
                             const citation =
                                 targetPhase === 'assess'
-                                    ? payload.assessments[1]!.result.citations[1]!
+                                    ? payload.assessments[1]!.checks[0]!.sourceRefs[0]!
                                     : payload.entries[1]!.citations[1]!;
                             const selection = citation as unknown as Record<string, unknown>;
                             delete selection.quote;
@@ -779,10 +822,12 @@ describe('precise citation correction feedback', () => {
                                 );
                             const citation =
                                 targetPhase === 'assess'
-                                    ? payload.assessments[0]!.result.citations[1]!
+                                    ? payload.assessments[0]!.checks[0]!.sourceRefs[0]!
                                     : payload.entries[1]!.citations[1]!;
-                            const evidence = records(prepared).find((record) => record.ref === correction!.ref)!;
-                            citation.ref = correction!.ref;
+                            const evidence = records(prepared).find(
+                                (record) => digest(record.ref) === correction!.refHash,
+                            )!;
+                            citation.ref = evidence.ref;
                             citation.quote = evidence.text;
                             corrected = true;
                         }
@@ -836,7 +881,7 @@ describe('governed phase execution through actual SDK provider wires', () => {
         expect(rejections.every((event) => event.data.code === 'phase_shape_invalid')).toBe(true);
         expect(rejections[0].data.details.validation).toContainEqual({
             code: 'unrecognized_keys',
-            path: ['assessments', 0, 'result', 'citations', 0],
+            path: ['assessments', 0, 'checks', 0, 'sourceRefs', 0],
         });
     });
     it('supplies sealed complete metadata and separates inventory navigation from unified patch reading', async () => {
@@ -1621,9 +1666,14 @@ describe('deterministic policy classification integrity', () => {
                 },
             }),
         });
-        expect(result.state.decision?.exitCode).not.toBe(0);
-        expect(result.state.reviewStatus).toBe('incomplete');
-        expect(readFileSync(join(result.directory, 'diagnostics.jsonl'), 'utf8')).toContain('submission_rejected');
+        expect(result.state.decision?.exitCode).toBe(1);
+        expect(result.state.reviewStatus).toBe('complete');
+        expect(result.state.entries.every((entry) => entry.result.finding === 'binding_violation')).toBe(true);
+        expect(
+            result.state.findings.every(
+                (finding) => finding.verified && finding.classification === 'binding_violation',
+            ),
+        ).toBe(true);
     });
     it('records actual phase models and mixed provider identity without a fabricated single model', async () => {
         vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
@@ -1988,7 +2038,7 @@ describe('one coherent investigation and one independent check', () => {
                     (m) =>
                         m.role === 'user' &&
                         m.content.includes('Continue the same investigation') &&
-                        m.content.includes(prepared.state.entries[1]!.assessmentId),
+                        m.content.includes('context_2'),
                 );
             },
             mutate(phase, payload, n) {
@@ -2061,7 +2111,124 @@ describe('one coherent investigation and one independent check', () => {
         });
         expect(result.state.entries[0]!.result.correction).not.toBe('Restore authorization before return.');
         expect(result.state.decision).toMatchObject({ exitCode: 1, complete: false });
+        const report = projectReviewReport(result.state);
+        expect(report.completion).toBe('incomplete');
+        expect(report.runner).toMatchObject({ reviewExit: 1, exitCode: 1 });
+        expect(
+            report.outcomes.every(
+                (outcome) =>
+                    outcome.disposition === 'unresolved' && outcome.finding === 'binding_violation' && outcome.blocking,
+            ),
+        ).toBe(true);
         expect(() => validatePublicationArtifacts(result.directory, result.state, result.statePath)).not.toThrow();
+    });
+    it('retains mixed known findings and unresolved checks through assessment resume, verification and reporting', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        const prepared = await createPreparedFixture();
+        const wire = fixtureWire(prepared, 'openrouter', {
+            mutate(phase, payload) {
+                if (phase !== 'assess') return;
+                for (const assessment of payload.assessments) {
+                    assessment.result.disposition = 'unresolved';
+                    assessment.result.confidence = 3;
+                    assessment.result.confidenceReason = 'The missing external value is known with high certainty.';
+                    assessment.checks.push({
+                        ...assessment.checks[0]!,
+                        interpretation: 'Verify the external package selection.',
+                        disposition: 'unresolved',
+                        missingEvidence: 'Inspect the external selected package version.',
+                    });
+                }
+            },
+        });
+        const first = await runReview({
+            ...fixtureOptions(prepared),
+            fetch: (url, init) =>
+                phaseRequest(JSON.parse(init!.body as string), prepared).phase === 'verify'
+                    ? Promise.resolve(stoppedResponse())
+                    : wire(url, init),
+        });
+        const loaded = loadReviewCheckpoint(first.directory, {
+            artifact: prepared.state.artifact,
+            reviewerId: prepared.state.requestedReviewerId,
+        });
+        const resumed = await runReview({
+            ...fixtureOptions(loaded.prepared),
+            resume: loaded.checkpoint,
+            fetch: fixtureWire(prepared),
+        });
+        expect(resumed.state.execution.stopReason).toBe('finished');
+        expect(resumed.state.verification).toMatchObject({ verified: 2, complete: true });
+        expect(resumed.state.reviewStatus).toBe('incomplete');
+        expect(resumed.state.decision).toMatchObject({ exitCode: 1, complete: false });
+        expect(resumed.state.findings).toHaveLength(1);
+        expect(resumed.state.findings[0]!.assessmentIds).toHaveLength(2);
+        expect(resumed.state.findings.every((finding) => finding.verified)).toBe(true);
+        expect(
+            resumed.state.entries.every(
+                (entry) =>
+                    entry.result.disposition === 'unresolved' &&
+                    entry.result.confidence === null &&
+                    entry.result.finding === 'none',
+            ),
+        ).toBe(true);
+        expect(() => validatePublicationArtifacts(resumed.directory, resumed.state, resumed.statePath)).not.toThrow();
+        const report = projectReviewReport(resumed.state);
+        expect(
+            report.outcomes.every(
+                (entry) =>
+                    entry.disposition === 'unresolved' && entry.finding === 'binding_violation' && entry.blocking,
+            ),
+        ).toBe(true);
+        expect(report.runner).toMatchObject({ reviewExit: 1, exitCode: 1 });
+        expect(report.completion).toBe('incomplete');
+    });
+    it('accepts a verifier amendment preserving a known defect and adding an unresolved obligation', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        const prepared = await createPreparedFixture();
+        const result = await runReview({
+            ...fixtureOptions(prepared),
+            fetch: fixtureWire(prepared, 'openrouter', {
+                mutate(phase, payload) {
+                    if (phase !== 'verify') return;
+                    for (const entry of payload.entries) {
+                        const amendment = jointInput(prepared, [entry.assessmentId]).assessments[0]!;
+                        amendment.result.disposition = 'unresolved';
+                        amendment.result.confidence = 2;
+                        amendment.checks.push({
+                            ...amendment.checks[0]!,
+                            interpretation: 'Verify the external package selection.',
+                            disposition: 'unresolved',
+                            missingEvidence: 'Inspect current external version.',
+                        });
+                        entry.disposition = 'revise';
+                        entry.missingChecks = ['Inspect current external version.'];
+                        entry.amendment = amendment as NonNullable<typeof entry.amendment>;
+                        for (const finding of entry.findings) {
+                            finding.accepted = false;
+                            finding.suggestionAccepted = false;
+                        }
+                    }
+                },
+            }),
+        });
+        expect(result.state.execution.stopReason).toBe('finished');
+        expect(result.state.verification).toMatchObject({ verified: 2, complete: true });
+        expect(result.state.decision).toMatchObject({ exitCode: 1, complete: false });
+        expect(result.state.findings).toHaveLength(1);
+        expect(result.state.findings[0]!.assessmentIds).toHaveLength(2);
+        expect(result.state.findings.every((finding) => finding.verified)).toBe(true);
+        expect(
+            result.state.entries.every(
+                (entry) => entry.result.disposition === 'unresolved' && entry.result.confidence === null,
+            ),
+        ).toBe(true);
+        expect(() => validatePublicationArtifacts(result.directory, result.state, result.statePath)).not.toThrow();
+        expect(
+            projectReviewReport(result.state).outcomes.every(
+                (outcome) => outcome.blocking && outcome.disposition === 'unresolved',
+            ),
+        ).toBe(true);
     });
     it('applies an evidenced verifier correction without another model phase or retained rejected claims', async () => {
         vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
@@ -2079,7 +2246,9 @@ describe('one coherent investigation and one independent check', () => {
                             finding.accepted = false;
                             finding.suggestionAccepted = false;
                         });
-                        entry.resolution = {
+                        const replacement = jointInput(prepared, [entry.assessmentId]).assessments[0]!;
+                        replacement.findings = [];
+                        replacement.result = {
                             ...submissions(prepared).find((result) => result.assessmentId === entry.assessmentId)!,
                             finding: 'none',
                             adherence: 2,
@@ -2090,6 +2259,7 @@ describe('one coherent investigation and one independent check', () => {
                             limitations: ['Source inspection only.'],
                             confidenceReason: 'Independently inspected the permitted path and governing rule.',
                         };
+                        entry.amendment = replacement as NonNullable<typeof entry.amendment>;
                     }
                 },
             }),
@@ -2398,6 +2568,249 @@ describe('one coherent investigation and one independent check', () => {
         expect(result.state.verification.verified).toBe(2);
         expect(() => validatePublicationArtifacts(result.directory, result.state, result.statePath)).not.toThrow();
     });
+    it.each(['assess', 'verify'] as const)(
+        'resets %s correction allowance only after new contexts are accepted',
+        async (targetPhase) => {
+            vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+            const prepared = await createPreparedFixture();
+            let rounds = 0;
+            const result = await runReview({
+                ...fixtureOptions(prepared),
+                fetch: fixtureWire(prepared, 'openrouter', {
+                    mutate(phase, payload, round) {
+                        if (phase !== targetPhase) return;
+                        rounds = round;
+                        const index = round <= 2 ? 0 : 1;
+                        const invalid = round === 1 || round === 3 || round === 4;
+                        if (phase === 'assess') {
+                            payload.assessments = [payload.assessments[index]!];
+                            if (invalid)
+                                payload.assessments[0]!.checks[0]!.sourceRefs[0]!.ref = 'evidence:' + '0'.repeat(64);
+                        } else {
+                            payload.entries = [payload.entries[index]!];
+                            if (invalid) payload.entries[0]!.citations[1]!.ref = 'evidence:' + '0'.repeat(64);
+                        }
+                    },
+                }),
+            });
+            expect(rounds).toBe(5);
+            expect(result.state.reviewStatus).toBe('complete');
+            expect(result.state.verification).toMatchObject({ verified: 2, complete: true });
+            const rejected = readFileSync(join(result.directory, 'diagnostics.jsonl'), 'utf8')
+                .trim()
+                .split('\n')
+                .map((line) => JSON.parse(line))
+                .filter((event) => event.kind === 'submission_rejected');
+            expect(rejected.map((event) => event.data.count)).toEqual([1, 1, 2]);
+        },
+    );
+    it.each(['assess', 'verify'] as const)(
+        'does not reset stalled %s corrections for reads or repeated accepted contexts',
+        async (targetPhase) => {
+            vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+            const prepared = await createPreparedFixture();
+            let rounds = 0;
+            let reads = 0;
+            let readBeforeNext = false;
+            const wire = fixtureWire(prepared, 'openrouter', {
+                mutate(phase, payload, round) {
+                    if (phase !== targetPhase) return;
+                    rounds = round;
+                    readBeforeNext = true;
+                    if (phase === 'assess') {
+                        if (round === 1) payload.assessments = payload.assessments.slice(0, 1);
+                        else payload.assessments[1]!.checks[0]!.sourceRefs[0]!.ref = 'evidence:' + '0'.repeat(64);
+                    } else {
+                        if (round === 1) payload.entries = payload.entries.slice(0, 1);
+                        else payload.entries[1]!.citations[1]!.ref = 'evidence:' + '0'.repeat(64);
+                    }
+                },
+            });
+            const result = await runReview({
+                ...fixtureOptions(prepared),
+                fetch: async (url, init) => {
+                    const body = JSON.parse(init!.body as string) as WireRequest;
+                    if (phaseRequest(body, prepared).phase === targetPhase && readBeforeNext) {
+                        readBeforeNext = false;
+                        reads++;
+                        return response(
+                            'openrouter',
+                            [{ name: 'read_source', input: { side: 'head', path: 'route.ts' } }],
+                            100 + reads,
+                        );
+                    }
+                    return wire(url, init);
+                },
+            });
+            expect(rounds).toBe(4);
+            expect(reads).toBe(3);
+            expect(result.state.reviewStatus).toBe('incomplete');
+            expect(result.state.execution.stopReason).toBe('phase_corrections_exhausted');
+            expect(result.state.verification.complete).toBe(false);
+        },
+    );
+    it('retains valid verifier siblings and accepts only the corrected remaining context', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        const prepared = await createPreparedFixture();
+        let sawRemaining = false;
+        const result = await runReview({
+            ...fixtureOptions(prepared),
+            fetch: fixtureWire(prepared, 'openrouter', {
+                shortHandles: true,
+                request(body) {
+                    for (const message of body.messages) {
+                        if (message.role !== 'tool' || !message.content.startsWith('{')) continue;
+                        const feedback = JSON.parse(message.content);
+                        if (feedback.code !== 'unproposed_suggestion_acceptance') continue;
+                        expect(feedback.newlyAccepted).toEqual(['context_1']);
+                        expect(feedback.remaining).toEqual(['context_2']);
+                        expect(feedback.corrections[0].assessmentId).toBe('context_2');
+                        sawRemaining = true;
+                    }
+                },
+                mutate(phase, payload, call) {
+                    if (phase !== 'verify') return;
+                    if (call === 1) payload.entries[1]!.findings[0]!.suggestionAccepted = true;
+                    else payload.entries = payload.entries.slice(1);
+                },
+            }),
+        });
+        expect(sawRemaining).toBe(true);
+        expect(result.state.reviewStatus).toBe('complete');
+        expect(result.state.verification.verified).toBe(2);
+        const phase = result.state.phases.find((phase) => phase.phase === 'verify')!;
+        expect(phase.output).toHaveLength(2);
+    });
+    it('records incomplete verifier progress without promoting it and restarts verification on resume', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        const prepared = await createPreparedFixture();
+        const result = await runReview({
+            ...fixtureOptions(prepared),
+            fetch: fixtureWire(prepared, 'openrouter', {
+                mutate(phase, payload, call) {
+                    if (phase !== 'verify') return;
+                    payload.entries[1]!.findings[0]!.suggestionAccepted = true;
+                    if (call > 1) payload.entries[0]!.reason = 'Must not overwrite retained verification';
+                },
+            }),
+        });
+        expect(result.state.reviewStatus).toBe('incomplete');
+        expect(result.state.verification.complete).toBe(false);
+        const phase = result.state.phases.find((phase) => phase.phase === 'verify')!;
+        expect(phase.configuration.kind).toBe('partial_verification_progress');
+        expect(phase.output).toMatchObject({
+            verifications: [
+                {
+                    assessmentId: prepared.state.entries[0]!.assessmentId,
+                    reason: 'Original criterion and direct source confirm the violation.',
+                },
+            ],
+            remaining: [prepared.state.entries[1]!.assessmentId],
+        });
+        const loaded = loadReviewCheckpoint(result.directory, {
+            artifact: prepared.state.artifact,
+            reviewerId: prepared.state.requestedReviewerId,
+        });
+        const resumed = await runReview({
+            ...fixtureOptions(loaded.prepared),
+            resume: loaded.checkpoint,
+            fetch: fixtureWire(prepared),
+        });
+        expect(resumed.state.reviewStatus).toBe('complete');
+        expect(resumed.state.verification.verified).toBe(2);
+    });
+    it('completes both phases with short handles including dynamically read source evidence', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        const prepared = await createPreparedFixture();
+        const result = await runReview({
+            ...fixtureOptions(prepared),
+            fetch: fixtureWire(prepared, 'openrouter', { shortHandles: true }),
+        });
+        expect(result.state.reviewStatus).toBe('complete');
+        expect(result.state.verification.verified).toBe(2);
+        expect(records(prepared).some((record) => record.provenance.kind === 'source')).toBe(true);
+        const dynamicSource = records(prepared).find((record) => record.provenance.kind === 'source')!;
+        for (const phase of result.state.phases.filter((phase) => phase.status === 'complete')) {
+            const identities = phase.configuration.modelIdentifiers as Record<string, string>;
+            expect(identities.context_1).toBe(prepared.state.entries[0]!.assessmentId);
+            expect(Object.values(identities)).toContain(dynamicSource.ref);
+            expect(JSON.stringify(identities)).not.toContain(dynamicSource.text);
+        }
+        for (const entry of result.state.entries) {
+            expect(entry.assessmentId).toMatch(/^assessment:/u);
+            if (entry.result.disposition !== 'not_evaluated')
+                for (const citation of entry.result.citations) expect(citation.ref).toMatch(/^evidence:/u);
+        }
+        expect(() => validatePublicationArtifacts(result.directory, result.state, result.statePath)).not.toThrow();
+    });
+    it('derives result citations from checks without asking the model to repeat governing or source evidence', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        const prepared = await createPreparedFixture();
+        const result = await runReview({
+            ...fixtureOptions(prepared),
+            fetch: fixtureWire(prepared, 'openrouter', {
+                request(body) {
+                    const tool = body.tools.find((tool) => tool.function?.name === 'submit_assessments');
+                    if (tool) {
+                        expect(tool).toHaveProperty(
+                            'function.parameters.properties.assessments.items.properties.result',
+                        );
+                        expect(JSON.stringify(tool)).not.toContain('"citations":');
+                    }
+                },
+                mutate(phase, payload) {
+                    if (phase !== 'assess') return;
+                    // Even a stale summary citation from another context is irrelevant: the wire omits it.
+                    payload.assessments[0]!.result.citations = payload.assessments[1]!.result.citations;
+                },
+            }),
+        });
+        expect(result.state.reviewStatus).toBe('complete');
+        for (const entry of result.state.entries) {
+            expect(entry.result.disposition).toBe('evaluated');
+            if (entry.result.disposition === 'not_evaluated') continue;
+            expect(
+                entry.result.citations.some(
+                    (citation) =>
+                        citation.provenance.kind === 'publication' && citation.provenance.nodeId === entry.nodeId,
+                ),
+            ).toBe(true);
+            expect(entry.result.citations.some((citation) => citation.provenance.kind === 'source')).toBe(true);
+        }
+    });
+    it.each(['foreign governing passage', 'missing source', 'foreign nonapplicable passage'] as const)(
+        'still rejects %s when deriving result citations',
+        async (defect) => {
+            vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+            const prepared = await createPreparedFixture();
+            const result = await runReview({
+                ...fixtureOptions(prepared),
+                fetch: fixtureWire(prepared, 'openrouter', {
+                    mutate(phase, payload) {
+                        if (phase !== 'assess') return;
+                        if (defect !== 'missing source')
+                            payload.assessments[0]!.checks[0]!.passage = payload.assessments[1]!.checks[0]!.passage;
+                        else for (const check of payload.assessments[0]!.checks) check.sourceRefs = [];
+                        if (defect === 'foreign nonapplicable passage') {
+                            const assessment = payload.assessments[0]!;
+                            Object.assign(assessment.result, {
+                                disposition: 'not_applicable',
+                                adherence: null,
+                                confidence: null,
+                                finding: 'none',
+                            });
+                            assessment.findings = [];
+                            for (const check of assessment.checks)
+                                Object.assign(check, { disposition: 'not_applicable', sourceRefs: [] });
+                        }
+                    },
+                }),
+            });
+            expect(result.state.reviewStatus).toBe('incomplete');
+            expect(result.state.verification.verified).toBe(0);
+            expect(result.state.execution.stopReason).toBe('phase_corrections_exhausted');
+        },
+    );
     it('resumes only unfinished criterion judgments from a sealed partial investigation', async () => {
         vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
         const prepared = await createPreparedFixture();
@@ -2414,6 +2827,19 @@ describe('one coherent investigation and one independent check', () => {
             ...fixtureOptions(prepared),
             fetch: (url, init) => (submitted ? Promise.resolve(stoppedResponse()) : wire(url, init)),
         });
+        expect(assessmentCoverage(first.state)).toMatchObject({
+            assessed: 0,
+            savedProposals: 1,
+            awaitingVerification: 0,
+            verified: 0,
+            unexamined: 1,
+        });
+        expect(first.state.decision.complete).toBe(false);
+        expect(() => validatePublicationArtifacts(first.directory, first.state, first.statePath)).not.toThrow();
+        expect(renderActionSummary(first.state)).toContain('| Saved proposals / incomplete assessment handoff | 1 |');
+        const partialReport = readFileSync(join(first.directory, 'report.md'), 'utf8');
+        expect(partialReport).toContain('1 saved proposals with an incomplete assessment handoff; 1 unexamined');
+        expect(partialReport).toContain('Proposal saved; assessment handoff incomplete and independently unverified.');
         const loaded = loadReviewCheckpoint(first.directory, {
             artifact: prepared.state.artifact,
             reviewerId: prepared.state.requestedReviewerId,

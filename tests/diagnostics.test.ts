@@ -20,6 +20,23 @@ afterEach(() => {
     for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 describe('safe diagnostics independent of console level', () => {
+    it('shows verifier progress and continuation at info level', async () => {
+        const dir = mkdtempSync(join(tmpdir(), 'governed-diag-'));
+        dirs.push(dir);
+        const log = vi.fn();
+        const diagnostics = new Diagnostics(dir, 'run-id', 'info', log);
+        await diagnostics.event('verification_progress', {
+            newlyAccepted: ['assessment:a'],
+            remaining: ['assessment:b'],
+        });
+        await diagnostics.event('verification_continuation', { remaining: ['assessment:b'] });
+        await diagnostics.flush();
+        expect(log).toHaveBeenCalledTimes(2);
+        expect(log.mock.calls.map(([line]) => JSON.parse(line).kind)).toEqual([
+            'verification_progress',
+            'verification_continuation',
+        ]);
+    });
     it.each(['quiet', 'info', 'debug'] as LogLevel[])(
         '%s always retains safe correlated events without request or source bodies',
         async (level) => {

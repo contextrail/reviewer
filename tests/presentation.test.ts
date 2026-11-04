@@ -348,6 +348,41 @@ describe('assessment progress before independent verification', () => {
             'Assessed 3/4; awaiting verification 2; needs reassessment 1; verified 0; unexamined 1.',
         );
     });
+    it('shows saved partial proposals separately from complete handoffs and verified outcomes', () => {
+        const { report, common } = pendingCoverageFixture();
+        const partial = createPhaseRecord({
+            ...common,
+            status: 'failed',
+            configuration: { kind: 'partial_assessment_progress' },
+            output: {
+                assessments: [{ result: { assessmentId: 'a', disposition: 'evaluated' }, checks: [], findings: [] }],
+                remaining: ['b', 'c'],
+            },
+        });
+        report.phases = [partial];
+        const before = JSON.stringify(report);
+        expect(assessmentCoverage(report)).toMatchObject({
+            assessed: 0,
+            savedProposals: 1,
+            verified: 0,
+            awaitingVerification: 0,
+            unexamined: 3,
+            entries: expect.arrayContaining([{ assessmentId: 'a', status: 'saved_proposal' }]),
+        });
+        expect(renderReviewComment(report)).toContain('Saved proposals: 1.');
+        expect(renderReviewComment(report)).not.toContain('Unverified candidate must stay out');
+        expect(JSON.stringify(report)).toBe(before);
+        for (const output of [
+            { assessments: [{ result: { assessmentId: 'a', disposition: 'evaluated' } }], remaining: ['a', 'c'] },
+            { assessments: [{ result: { assessmentId: 'a', disposition: 'evaluated' } }], remaining: ['b'] },
+        ]) {
+            const invalid = createPhaseRecord({ ...partial, output });
+            expect(assessmentCoverage({ ...report, phases: [invalid] })).toMatchObject({
+                savedProposals: 0,
+                unexamined: 4,
+            });
+        }
+    });
     it('does not infer assessment progress from partial, corrupt, foreign or different-snapshot handoffs', () => {
         const { report, common, assess } = pendingCoverageFixture();
         const malformed = [

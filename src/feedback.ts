@@ -20,6 +20,18 @@ export interface ReviewFeedbackSender {
     submitReport(report: ReviewReportInput): Promise<unknown>;
 }
 
+/** An unresolved criterion can still have independently verified, actionable finding accounts. */
+function reportedFinding(state: ReviewState, entry: ReviewState['entries'][number]) {
+    if (entry.result.disposition !== 'unresolved') return 'finding' in entry.result ? entry.result.finding : 'none';
+    const classes = state.findings
+        .filter((finding) => finding.verified && finding.assessmentIds.includes(entry.assessmentId))
+        .map((finding) => finding.classification);
+    return (
+        (['binding_violation', 'behavioral_defect', 'guidance_departure'] as const).find((classification) =>
+            classes.includes(classification),
+        ) ?? 'none'
+    );
+}
 /** Construct from the allowlist. Never serialize local state then remove fields. */
 export function projectReviewReport(state: ReviewState, repositoryAttribution = false): ReviewReportInput {
     if (!state.reviewer || !state.decision || state.reviewStatus === 'running') throw new Error('review_not_finalized');
@@ -69,7 +81,7 @@ export function projectReviewReport(state: ReviewState, repositoryAttribution = 
             disposition: entry.result.disposition,
             adherence: entry.result.adherence,
             confidence: entry.result.confidence,
-            finding: 'finding' in entry.result ? entry.result.finding : 'none',
+            finding: reportedFinding(state, entry),
             blocking: state.decision!.reasons.some(
                 (reason) => reason.assessmentId === entry.assessmentId && reason.blocking,
             ),

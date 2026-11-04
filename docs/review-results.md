@@ -15,6 +15,21 @@ Adherence and confidence answer different questions:
 | Adherence 2          | Supported adherence within the examined scope, including permitted alternatives that satisfy Guidance intent.                                           |
 | Confidence 1 / 2 / 3 | The model reports low / medium / high confidence in the judgment, with an explanation of support and uncertainty. This is not a calibrated probability. |
 
+New reviews derive adherence deterministically from the finding accounts: an evaluated
+criterion with no findings receives 2; one with findings receives 0. Models no longer
+author a separate adherence score or aggregate finding claim. Score 1 remains readable
+in historical records. Aggregate classification, consequence and correction come from
+the actual findings, and independent verification still determines whether they are accepted.
+For new reviews, `--min-adherence 1` and `--min-adherence 2` therefore have the same effect:
+both also block supported guidance departures. Without an adherence threshold, those remain advisory.
+
+A criterion can contain both supported findings and unresolved obligations. Its overall
+judgment remains unresolved with null scores; the independently verified findings remain
+visible and can block the review. Confidence expressed about an evidence gap is retained
+in the explanation, not treated as confidence in a completed criterion assessment.
+Reporting preserves the unresolved disposition alongside the known finding classification.
+The API receiver must support this mixed-outcome contract before accepting these reports.
+
 Unresolved or not-evaluated entries have null scores. Reasoned not-applicable
 entries have null adherence and may have confidence. Missing evidence is not a
 violation or a zero. Citations establish where evidence came from; they do not

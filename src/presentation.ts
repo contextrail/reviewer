@@ -286,6 +286,7 @@ function metricText(
 }
 type CoverageHandoffs = {
     historical: Set<string>;
+    partial: Set<string>;
     current: Map<string, { ref: string; hash: string }>;
     verification: Map<string, string>;
 };
@@ -319,11 +320,32 @@ function completeOutput(phase: PhaseRecord, ids: string[]): boolean {
         ids.every((id) => phase.assessmentIds.includes(id))
     );
 }
+function recordPartialAssessment(phase: PhaseRecord, handoffs: CoverageHandoffs) {
+    if (phase.status === 'complete' || phase.configuration.kind !== 'partial_assessment_progress') return;
+    const output = object(phase.output);
+    if (!Array.isArray(output.assessments) || !Array.isArray(output.remaining)) return;
+    const proposals = objects(output.assessments);
+    const ids = proposals.map((p) => string(object(p.result).assessmentId));
+    const partition = [...ids, ...output.remaining];
+    if (
+        proposals.length !== output.assessments.length ||
+        partition.length !== phase.assessmentIds.length ||
+        new Set(partition).size !== partition.length ||
+        !partition.every((id) => phase.assessmentIds.includes(id)) ||
+        proposals.some(
+            (p) => !['evaluated', 'not_applicable', 'unresolved'].includes(string(object(p.result).disposition)),
+        )
+    )
+        return;
+    for (const id of ids) handoffs.partial.add(id);
+}
 function recordAssessment(phase: PhaseRecord, handoffs: CoverageHandoffs) {
     for (const id of phase.assessmentIds) {
+        handoffs.partial.delete(id);
         handoffs.current.delete(id);
         handoffs.verification.delete(id);
     }
+    recordPartialAssessment(phase, handoffs);
     const proposals = objects(phase.output);
     const ids = proposals.map((p) => string(object(p.result).assessmentId));
     if (
@@ -362,6 +384,7 @@ function recordVerification(phase: PhaseRecord, handoffs: CoverageHandoffs) {
 function coverageStatus(entry: Record<string, unknown>, verified: number, handoffs: CoverageHandoffs): string {
     const id = string(entry.assessmentId),
         disposition = string(object(entry.result).disposition);
+    if (handoffs.partial.has(id)) return 'saved_proposal';
     if (!handoffs.historical.has(id)) return 'unexamined';
     const verdict = handoffs.verification.get(id) ?? '';
     if (!handoffs.current.has(id) || ['reject', 'revise', 'unresolved'].includes(verdict)) return 'needs_reassessment';
@@ -375,7 +398,12 @@ export function assessmentCoverage(input: unknown) {
         entries = objects(state.entries);
     const ids = entries.map((e) => string(e.assessmentId)),
         scope = new Set(ids);
-    const handoffs: CoverageHandoffs = { historical: new Set(), current: new Map(), verification: new Map() };
+    const handoffs: CoverageHandoffs = {
+        historical: new Set(),
+        partial: new Set(),
+        current: new Map(),
+        verification: new Map(),
+    };
     if (ids.every(Boolean) && scope.size === ids.length) {
         for (const raw of objects(state.phases)) {
             const phase = coveragePhase(raw, state, scope);
@@ -396,6 +424,7 @@ export function assessmentCoverage(input: unknown) {
         total: entries.length,
         assessed: handoffs.historical.size,
         currentAssessments: handoffs.current.size,
+        savedProposals: handoffs.partial.size,
         verified,
         awaitingVerification: progress.filter((p) => p.status === 'awaiting_verification').length,
         needsReassessment: progress.filter((p) => p.status === 'needs_reassessment').length,
@@ -482,6 +511,7 @@ function renderChangeSummary(input: unknown): string {
 const verificationLabels: Record<string, string> = {
     verified: 'Checked',
     verified_unresolved: 'Checked; evidence needed',
+    saved_proposal: 'Saved proposal',
     awaiting_verification: 'Awaiting verification',
     needs_reassessment: 'Needs reassessment',
     unexamined: 'Not checked',
@@ -508,6 +538,8 @@ function criterionNote(result: Record<string, unknown>, status: string, accepted
     if (!accepted && ['binding_violation', 'behavioral_defect', 'guidance_departure'].includes(string(result.finding)))
         return `Unverified judgment: ${explanation}${correction ? ` Proposed correction: ${correction}` : ''}`;
     if (explanation) return explanation;
+    if (status === 'saved_proposal')
+        return 'Proposal saved; assessment handoff incomplete and independently unverified.';
     if (status === 'awaiting_verification') return 'Assessment recorded; independent verification pending.';
     if (status === 'needs_reassessment') return 'Previous assessment requires a new assessment.';
     return 'No assessment explanation recorded.';
@@ -557,7 +589,7 @@ function renderGovernedFindings(
 ): string[] {
     if (!verified.length)
         return [
-            progress.awaitingVerification || progress.needsReassessment
+            progress.savedProposals || progress.awaitingVerification || progress.needsReassessment
                 ? 'Independent verification is incomplete. Recorded assessment proposals are not accepted review findings; candidate findings remain unverified.'
                 : 'No independently verified finding is recorded. Inspect each criterion and its verification before relying on this result.',
         ];
@@ -605,8 +637,12 @@ export function renderReviewComment(input: unknown, options: PresentationOptions
         '| Criterion / version | Outcome | Verification | Verified findings | Note |\n| --- | --- | --- | --- | --- |\n' +
             (criterionRows.join('\n') ||
                 '| No governed criteria recorded | Unavailable | Not checked | 0 | No assessment scope is available. |'),
-        'Each original criterion is listed in its recorded order. Checked means independently reviewed, including confirmed evidence gaps; it does not mean the requirement is satisfied. Awaiting verification is not acceptance. Assessed/unexamined counts use complete canonical assessment handoffs for this fixed comparison; final outcome labels retain the canonical disposition.',
+        'Each original criterion is listed in its recorded order. Checked means independently reviewed, including confirmed evidence gaps; it does not mean the requirement is satisfied. Awaiting verification is not acceptance. Assessed counts use complete canonical assessment handoffs for this fixed comparison. Saved proposals are separate unfinished work, not unexamined criteria or verified outcomes; final outcome labels retain the canonical disposition.',
     );
+    if (progress.savedProposals)
+        lines.push(
+            `Saved proposals: ${progress.savedProposals}. Assessment handoff incomplete; these are not verified outcomes.`,
+        );
     lines.push(renderChangeSummary(state));
     lines.push(renderRunDetails(execution, usage, options));
     return lines.join('\n\n') + '\n';
@@ -671,6 +707,7 @@ export function renderActionSummary(input: unknown, options: PresentationOptions
             'Assessed / awaiting verification / needs reassessment / unexamined',
             `${coverage.assessed} / ${coverage.awaitingVerification} / ${coverage.needsReassessment} / ${coverage.unexamined}`,
         ],
+        ['Saved proposals / incomplete assessment handoff', String(coverage.savedProposals)],
         ['Review duration', duration(e.elapsedMs)],
         ['Calls / completed SDK steps', `${usage.calls ?? 'unavailable'} / ${e.steps ?? 'unavailable'}`],
         ['Reported model cost', metricText(usage.cost, usage.calls, true)],

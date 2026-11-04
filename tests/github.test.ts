@@ -949,17 +949,11 @@ describe('real governed run publication boundary', () => {
                         {
                             result: {
                                 assessmentId: id,
-                                revisionOf: null,
                                 disposition: 'evaluated',
-                                adherence: 2,
                                 confidence: 3,
                                 confidenceReason: 'Direct inspected constant.',
-                                finding: 'none',
                                 explanation: 'The exported value is true.',
-                                consequence: '',
-                                correction: '',
                                 limitations: ['Source inspection only.'],
-                                citations: [governingCitation, sourceCitation],
                             },
                             checks: [
                                 {
@@ -986,7 +980,6 @@ describe('real governed run publication boundary', () => {
                             reason: 'The original rule and pinned source agree.',
                             citations: [governingCitation, cite(source!)],
                             missingChecks: [],
-                            resolution: null,
                             amendment: null,
                             findings: [],
                         },
