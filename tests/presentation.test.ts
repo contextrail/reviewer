@@ -106,11 +106,11 @@ describe('governed presentation', () => {
         const same = { provider: 'openai', model: 'phase-model', effort: 'high' };
         const phased = {
             ...state,
-            execution: { ...state.execution, phaseModels: { plan: same, assess: same, verify: same } },
+            execution: { ...state.execution, phaseModels: { assess: same, verify: same } },
         };
         const record = runRecord(config, { base: 'a'.repeat(40), head: 'b'.repeat(40) }, phased, 1, null, false);
         expect(record.row).toMatchObject({ provider: 'openai', model: 'phase-model', effort: 'high' });
-        expect(record.row.phaseModels).toHaveLength(3);
+        expect(record.row.phaseModels).toHaveLength(2);
     });
     it('writes v2 history, retains v1 reading and preserves a finished assessment after failure', () => {
         const config = {

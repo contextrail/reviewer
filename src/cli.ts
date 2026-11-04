@@ -46,8 +46,7 @@ review requires --provider openai|openrouter and --model PROVIDER_NATIVE_ID
 (or CONTEXTRAIL_REVIEW_PROVIDER / CONTEXTRAIL_REVIEW_MODEL). CLI overrides environment.
 Credentials: OPENAI_API_KEY / OPENROUTER_API_KEY. No implicit provider/model fallback.
 --effort none|minimal|low|medium|high|xhigh (provider/model must support it).
---phase-models JSON overrides assess/verify with explicit {provider,model,effort?} objects; legacy plan is accepted but unused.
---max-parallel 1..50 remains accepted for compatibility; a reviewer uses one coherent session.
+--phase-models JSON overrides assess/verify with explicit {provider,model,effort?} objects.
 --log-level quiet|info|debug (default info).
 --purpose TEXT supplies caller-stated objective/stage; no inferred objective is treated as approved.
 --pr-context PATH supplies bounded, untrusted PR history/discussion data bound to this comparison; never approval or governing instructions.
@@ -102,7 +101,6 @@ function readArguments() {
             model: { type: 'string' },
             effort: { type: 'string' },
             'phase-models': { type: 'string' },
-            'max-parallel': { type: 'string' },
             'log-level': { type: 'string' },
             repository: { type: 'string' },
             'pr-number': { type: 'string' },
@@ -206,20 +204,17 @@ function readPhaseModel(config: object): ProviderConfiguration {
     };
 }
 function readPhaseModels(input: string | undefined) {
-    const phaseModels: Partial<Record<'plan' | 'assess' | 'verify', ProviderConfiguration>> = {};
+    const phaseModels: Partial<Record<'assess' | 'verify', ProviderConfiguration>> = {};
     if (!input) return phaseModels;
     try {
         const parsed: unknown = JSON.parse(input);
         if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error();
         for (const [phase, config] of Object.entries(parsed)) {
-            if (!['plan', 'assess', 'verify'].includes(phase) || !config || typeof config !== 'object')
-                throw new Error();
+            if (!['assess', 'verify'].includes(phase) || !config || typeof config !== 'object') throw new Error();
             phaseModels[phase as keyof typeof phaseModels] = readPhaseModel(config);
         }
     } catch {
-        throw new CliInputError(
-            'phase-models must contain only plan/assess/verify provider/model/optional effort objects.',
-        );
+        throw new CliInputError('phase-models must contain only assess/verify provider/model/optional effort objects.');
     }
     return phaseModels;
 }
@@ -276,8 +271,7 @@ function commandSettings(values: CliValues, isReview: boolean) {
         (values['repository-attribution'] as boolean | undefined) ?? repositorySetting === 'true';
     const defaults = {
         provider: undefined as ProviderConfiguration | undefined,
-        phaseModels: {} as Partial<Record<'plan' | 'assess' | 'verify', ProviderConfiguration>>,
-        maxParallel: 3,
+        phaseModels: {} as Partial<Record<'assess' | 'verify', ProviderConfiguration>>,
         logLevel: 'info' as 'quiet' | 'info' | 'debug',
         limits: { ...DEFAULT_EXECUTION_LIMITS },
         sourceLimits: {} as Partial<SourceLimits>,
@@ -290,8 +284,6 @@ function commandSettings(values: CliValues, isReview: boolean) {
     if (!isReview) return { setting, resumePath, feedback, repositoryAttribution, ...defaults };
     const provider = readProvider(setting);
     const phaseModels = readPhaseModels(setting('phase-models'));
-    const maxParallel = positive(setting('max-parallel'), 'max-parallel') ?? 3;
-    if (maxParallel > 50) throw new CliInputError('max-parallel must be 1..50.');
     const level = setting('log-level') ?? 'info';
     if (!['quiet', 'info', 'debug'].includes(level)) throw new CliInputError('Invalid log-level.');
     const logLevel = level as typeof defaults.logLevel;
@@ -304,7 +296,6 @@ function commandSettings(values: CliValues, isReview: boolean) {
         repositoryAttribution,
         provider,
         phaseModels,
-        maxParallel,
         logLevel,
         ...limits,
         policy,
@@ -340,7 +331,6 @@ async function runCommand(values: CliValues, isReview: boolean) {
         repositoryAttribution,
         provider,
         phaseModels,
-        maxParallel,
         logLevel,
         limits,
         sourceLimits,
@@ -389,7 +379,6 @@ async function runCommand(values: CliValues, isReview: boolean) {
                 resume: resumed?.checkpoint,
                 provider: provider!,
                 phaseModels,
-                maxParallel,
                 logLevel,
                 policy,
                 limits,

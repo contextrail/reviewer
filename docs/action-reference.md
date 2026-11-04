@@ -24,7 +24,7 @@ Look up a specific setting here. For a first integration, use [GitHub Actions se
 | `mcp-auth-token`                       | Required bearer credential; map from `secrets.CONTEXTRAIL_MCP_AUTH_TOKEN`.                                                                                |
 | `openai-api-key`, `openrouter-api-key` | Supply the selected provider's credential from its named secret.                                                                                          |
 
-Additional optional inputs: `phase-models` (JSON, default `{}`), `max-parallel` (1–50, default 3),
+Additional optional inputs: `phase-models` (JSON, default `{}`),
 `log-level` (`quiet|info|debug`, default `info`) and `inline-comments` (default `false`,
 requires `post-comment: 'true'`). The model deadline covers the complete model workflow,
 not a separate allowance for each phase or continuation. PR title/body are prepared as intent; `pr-context`

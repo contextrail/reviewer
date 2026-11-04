@@ -44,7 +44,16 @@ import {
 } from './diagnostics.js';
 import { exactIds, PlanCitationError } from './planning.js';
 import { loadReviewCheckpoint, type ReviewCheckpoint } from './resume.js';
-import { prepareEvidencePack, writeEvidencePack, readPackPublication } from './pack.js';
+import {
+    prepareEvidencePack,
+    writeEvidencePack,
+    readPackPublication,
+    modelPackEvidence,
+    modelDiffEvidence,
+    repositoryInstructionsEvidence,
+    modelSourceEvidence,
+} from './pack.js';
+import { packageVersion } from './version.js';
 import {
     reviewSelectionSchema,
     ReviewAccumulator,
@@ -107,13 +116,11 @@ export type ReviewState = Omit<PreparedState, 'schemaVersion' | 'entries' | 'rev
         reporting: ReportingStatus;
         capture: string;
         reservedTurns: number;
-        maxParallel: number;
         logLevel: LogLevel;
     };
     decision: ReturnType<typeof decideExit> | null;
 };
 const phaseOverridesSchema = z.strictObject({
-    plan: z.unknown().optional(),
     assess: z.unknown().optional(),
     verify: z.unknown().optional(),
 });
@@ -126,7 +133,7 @@ function phaseConfiguration(defaults: ProviderConfiguration, overrides: unknown 
     const base = providerSchema.parse(defaults),
         parsed = phaseOverridesSchema.parse(overrides);
     return Object.fromEntries(
-        (['plan', 'assess', 'verify'] as const).map((p) => [
+        (['assess', 'verify'] as const).map((p) => [
             p,
             parsed[p] === undefined ? base : providerSchema.parse(parsed[p]),
         ]),
@@ -138,8 +145,7 @@ const sensitivePath = (path: string) =>
     path
         .split('/')
         .some((part) => /^\.env(?:\.|$)|^(?:credentials|secrets)(?:\.|$)|\.(?:pem|key|p12|pfx)$/iu.test(part));
-const phaseFilename = (phase: string, unit: string, attempt: number) =>
-    phase === 'plan' && unit === 'all' && attempt === 1 ? 'plan.json' : `${phase}-${unit}-${attempt}.json`;
+const phaseFilename = (phase: string, unit: string, attempt: number) => `${phase}-${unit}-${attempt}.json`;
 const requireRuntime = createRequire(import.meta.url);
 const runtimeVersion = (name: string) => {
     try {
@@ -189,7 +195,6 @@ type ReviewOptions = {
     prepared: { state: PreparedState; statePath: string; materialPath: string; manifestPath?: string };
     provider: ProviderConfiguration;
     phaseModels?: Partial<Record<ModelPhase, ProviderConfiguration>>;
-    maxParallel?: number;
     logLevel?: LogLevel;
     policy?: Partial<ReviewPolicy>;
     limits?: Partial<ExecutionLimits>;
@@ -210,13 +215,12 @@ function initialReviewState(
     prContext: PrContext | null,
     settings: {
         models: Record<ModelPhase, ProviderConfiguration>;
-        maxParallel: number;
         logLevel: LogLevel;
         limits: ExecutionLimits;
     },
 ): ReviewState {
     const { prepared } = options,
-        { models, maxParallel, logLevel, limits } = settings;
+        { models, logLevel, limits } = settings;
     return {
         ...structuredClone(prepared.state),
         schemaVersion: 2,
@@ -262,7 +266,6 @@ function initialReviewState(
             capture:
                 'Bounded phase assessment artifacts and safe diagnostic metadata. No raw prompt/response conversations, headers, error bodies or hidden reasoning. Caller-managed access and retention.',
             reservedTurns: budget.reservedTurns,
-            maxParallel,
             logLevel,
         },
     };
@@ -335,9 +338,7 @@ async function createReviewRuntime(options: ReviewOptions) {
         directory = dirname(prepared.statePath),
         source = new FixedSnapshotSource(prepared.state.artifact, options.sourceLimits);
     const models = phaseConfiguration(options.provider, options.phaseModels),
-        maxParallel = options.maxParallel ?? 3,
         logLevel = options.logLevel ?? 'info';
-    if (!Number.isInteger(maxParallel) || maxParallel < 1 || maxParallel > 50) throw new Error('invalid_max_parallel');
     if (!['quiet', 'info', 'debug'].includes(logLevel)) throw new Error('invalid_log_level');
     const limits = { ...DEFAULT_EXECUTION_LIMITS, ...options.limits },
         budget = new ReviewBudget(limits);
@@ -348,7 +349,7 @@ async function createReviewRuntime(options: ReviewOptions) {
               prepared.state.reviewer?.nodeId ?? options.prContext.reviewer,
           )
         : null;
-    const state = initialReviewState(options, source, budget, prContext, { models, maxParallel, logLevel, limits });
+    const state = initialReviewState(options, source, budget, prContext, { models, logLevel, limits });
     const diagnostics = new Diagnostics(directory, state.runId, logLevel),
         ledger = new EvidenceLedger();
     restoreCheckpoint(options, directory, state, ledger);
@@ -389,6 +390,8 @@ async function createReviewRuntime(options: ReviewOptions) {
         preparedManifest,
         manifestHash,
         materialHash,
+        repositoryInstructions: undefined as Awaited<ReturnType<typeof repositoryInstructionsEvidence>> | undefined,
+        modelDiff: undefined as Awaited<ReturnType<typeof modelDiffEvidence>> | undefined,
         invocationPhaseIndex,
         previousCalls,
         previousElapsed,
@@ -634,9 +637,9 @@ function submissionCorrection(error: unknown, code: string) {
               }
             : planCorrection) ??
         (code === 'verification_acceptance_inconsistent'
-            ? 'Accept means the assessment is supported, including an assessment proving code violations. Supported violation findings need accepted=true. If any finding is unsupported or missingChecks is nonempty, use revise/reject/unresolved for the context instead of accept; otherwise missingChecks must be empty.'
+            ? 'Accept means the assessment is supported, including an assessment proving code violations. Supported findings need decision=accept (or accept_with_suggestion for an independently checked proposed patch). If any finding is unsupported or missingChecks is nonempty, use revise/reject/unresolved for the context instead of accept; otherwise missingChecks must be empty.'
             : code === 'unproposed_suggestion_acceptance'
-              ? 'Set suggestionAccepted=false unless this exact finding contains a non-null proposedReplacement object that you independently checked. A prose correction is not a patch. A supported finding can have accepted=true and suggestionAccepted=false.'
+              ? 'Use decision=accept_with_suggestion only when this exact finding contains a non-null proposedReplacement object that you independently checked. Use decision=accept for a supported finding without an accepted patch.'
               : error instanceof z.ZodError
                 ? error.issues.map((i) => ({
                       code: i.code,
@@ -754,6 +757,32 @@ async function submitVerificationEntries<T>(session: PhaseRuntime<T>, rawInput: 
 }
 
 async function submitPhaseOutput<T>(session: PhaseRuntime<T>, rawInput: unknown) {
+    if (!session.assessmentAccumulator) return submitSinglePhaseOutput(session, rawInput);
+    let batch: { assessments: unknown[] };
+    try {
+        batch = z.strictObject({ assessments: z.array(z.unknown()).min(1) }).parse(rawInput);
+    } catch (error) {
+        return rejectSubmission(session, rawInput, error);
+    }
+    const replies = [];
+    for (const [entryIndex, candidate] of batch.assessments.entries()) {
+        const reply = await submitSinglePhaseOutput(session, { assessments: [candidate] });
+        replies.push({ ...reply, entryIndex });
+    }
+    const corrections = replies.filter((reply) => !reply.accepted);
+    return {
+        ...(corrections[0] ?? {}),
+        accepted: corrections.length === 0,
+        complete: remainingContexts(session).length === 0,
+        newlyAccepted: replies.flatMap((reply) => ('newlyAccepted' in reply ? reply.newlyAccepted : [])),
+        alreadyAccepted: replies.flatMap((reply) => ('alreadyAccepted' in reply ? reply.alreadyAccepted : [])),
+        remaining: remainingContexts(session),
+        corrections,
+        remainingCorrections: Math.max(0, 3 - correctionRounds(session)),
+    };
+}
+
+async function submitSinglePhaseOutput<T>(session: PhaseRuntime<T>, rawInput: unknown) {
     const { run, phase, workUnitId, assigned, schema, validate, attempt, signal, assessmentAccumulator } = session;
     const { diagnostics, ledger } = run;
     try {
@@ -917,7 +946,7 @@ function createPhaseTools<T>(session: PhaseRuntime<T>) {
             strict: true,
             description:
                 phase === 'assess'
-                    ? 'Submit exactly ONE remaining context assessment per call. Multiple separate tool calls may occur in one model response. Valid context proposals are retained immutably; feedback lists remaining context handles. Never submit several contexts in one assessments array. Independent verification is still required.'
+                    ? 'Submit one or more ready context assessments together. Each entry is validated independently; valid entries are retained when siblings need correction. Feedback lists remaining context handles. Independent verification is still required.'
                     : 'Submit one or more remaining context verifications. Valid entries are retained immutably even when another entry needs correction. Feedback lists remaining context handles; completion requires every assigned context.',
             inputSchema: schema,
             execute: async (rawInput: unknown) =>
@@ -1290,13 +1319,26 @@ function baseReviewPayload(run: ReviewRuntime) {
         artifact: run.state.artifact,
         purpose: run.options.purpose ?? null,
         prContext: run.prContext,
-        diff: run.prepared.state.diff,
+        observedRuntime: {
+            source: 'reviewer_runtime',
+            package: '@contextrail/code-review-agent',
+            packageVersion,
+            nodeVersion: process.version,
+            models: run.models,
+            comparison: { base: run.state.artifact.base.commit, head: run.state.artifact.head.commit },
+            capabilities: ['read_pinned_source', 'read_pinned_publications'],
+            limitations: ['Runtime identity is not proof of package safety, test execution or deployment readiness.'],
+        },
+        governingEvidence: modelPackEvidence(run.evidencePack!, run.ledger),
+        diff: run.modelDiff,
+        repositoryInstructions: run.repositoryInstructions,
         changedFiles: run.prepared.state.changes,
         sourceLimits: run.source.limits,
     };
 }
 async function prepareRunEvidence(run: ReviewRuntime) {
     const { state, directory, prepared, prContext, material, ledger } = run;
+    run.modelDiff = await modelDiffEvidence(directory, run.preparedManifest.files?.['diff.patch'], prepared.state.diff);
     await atomicJson(join(directory, 'prepared.json'), sanitizeRecord(prepared.state));
     if (prContext) await atomicJson(join(directory, 'pr-context.json'), sanitizeRecord(prContext));
     for (const entry of state.entries) {
@@ -1313,6 +1355,21 @@ async function prepareRunEvidence(run: ReviewRuntime) {
     for (const publication of Object.values(material)) ledger.publication(publication);
     run.evidencePack = prepareEvidencePack({ state: prepared.state, publications: material, ledger });
     await writeEvidencePack(directory, run.evidencePack);
+    const remaining = run.budget.remainingMs('assess');
+    if (remaining !== null && remaining <= 0) throw new BudgetStop('verification_time_reserved');
+    const deadline = remaining === null ? undefined : AbortSignal.timeout(Math.ceil(remaining));
+    const signals = [run.options.signal, deadline].filter((value): value is AbortSignal => value !== undefined);
+    try {
+        run.repositoryInstructions = await repositoryInstructionsEvidence(
+            run.source,
+            ledger,
+            signals.length ? AbortSignal.any(signals) : undefined,
+        );
+    } catch (error) {
+        if (deadline?.aborted) throw new BudgetStop('verification_time_reserved');
+        throw error;
+    }
+
     await run.persist();
 }
 async function restorePartialProposals(run: ReviewRuntime) {
@@ -1448,11 +1505,19 @@ async function verifyRun(run: ReviewRuntime, assessments: AssessmentProposal[]) 
         'verify',
         'all',
         state.entries,
-        { ...baseReviewPayload(run), evidencePack: run.evidencePack!.index, proposals: selected },
+        {
+            ...baseReviewPayload(run),
+            evidencePack: run.evidencePack!.index,
+            sourceEvidence: modelSourceEvidence(
+                ledger,
+                selected.flatMap((proposal) => proposal.result.citations.map((citation) => citation.ref)),
+            ),
+            proposals: selected,
+        },
         verificationSelectionSchema,
         (value) =>
             validateVerification(
-                resolveVerificationAmendments(value, state.entries),
+                resolveVerificationAmendments(value, state.entries, selected),
                 selected.filter((proposal) =>
                     (value as { entries: Array<{ assessmentId: string }> }).entries.some(
                         (entry) => entry.assessmentId === proposal.result.assessmentId,

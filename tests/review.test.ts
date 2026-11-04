@@ -15,6 +15,8 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { prepareReview, digest } from '../src/prepare.js';
+import type { modelPackEvidence, modelSourceEvidence } from '../src/pack.js';
+import { packageVersion } from '../src/version.js';
 import { runReview } from '../src/review.js';
 import { loadReviewCheckpoint } from '../src/resume.js';
 import { createPhaseRecord } from '../src/phases.js';
@@ -252,9 +254,19 @@ function phaseRequest(body: WireRequest, prepared: FixturePrepared) {
         prepared.state.entries.map((entry) => entry.assessmentId),
         Object.fromEntries(records(prepared).map((record) => [record.ref, record])),
     ).fromModel(JSON.parse(text)) as {
+        diff?: unknown;
         expectedChecklist?: Array<{ assessmentId: string }>;
         plan?: Array<{ assessmentId: string }>;
         proposals?: AssessmentProposal[];
+        governingEvidence: ReturnType<typeof modelPackEvidence>;
+        sourceEvidence?: ReturnType<typeof modelSourceEvidence>;
+        observedRuntime: {
+            source: string;
+            package: string;
+            packageVersion: string;
+            nodeVersion: string;
+            comparison: { base: string; head: string };
+        };
         originalPlan?: unknown;
         corrections?: unknown;
     };
@@ -281,6 +293,10 @@ function modelSelectors(input: unknown, prepared: FixturePrepared): unknown {
     if (value.resolution === null && 'amendment' in value) {
         const { resolution: _resolution, ...verdict } = value;
         return modelSelectors(verdict, prepared);
+    }
+    if (typeof value.findingId === 'string' && typeof value.accepted === 'boolean') {
+        const { accepted, suggestionAccepted, ...rest } = value;
+        return { ...rest, decision: suggestionAccepted ? 'accept_with_suggestion' : accepted ? 'accept' : 'reject' };
     }
     if (value.result && Array.isArray(value.checks)) {
         const {
@@ -453,6 +469,7 @@ function fixtureWire(
     provider: ReviewProvider = 'openrouter',
     opts: {
         separate?: boolean;
+        batchAssessments?: boolean;
         shortHandles?: boolean;
         units?: string[];
         mutate?: (phase: string, payload: WireSubmission, n: number) => void;
@@ -495,12 +512,22 @@ function fixtureWire(
                     opts.units[prepared.state.entries.findIndex((e) => e.assessmentId === entry.assessmentId)]!;
         opts.mutate?.(phase, payload as unknown as WireSubmission, n);
         const calls =
-            phase === 'assess'
+            phase === 'assess' && !opts.batchAssessments
                 ? (payload as AssessmentSubmission).assessments.map((assessment) => ({
                       name: 'submit_assessments',
                       input: { assessments: [assessment] },
                   }))
-                : [{ name: phase === 'plan' ? 'submit_plan' : 'submit_verification', input: payload }];
+                : [
+                      {
+                          name:
+                              phase === 'plan'
+                                  ? 'submit_plan'
+                                  : phase === 'assess'
+                                    ? 'submit_assessments'
+                                    : 'submit_verification',
+                          input: payload,
+                      },
+                  ];
         return response(
             provider,
             calls.map((call) => {
@@ -1551,9 +1578,15 @@ describe('source tool boundaries and verified suggestions', () => {
     it('records terminal timing for unexpected tool errors without logging their messages', async () => {
         vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
         const prepared = await preparedFixture();
-        const read = vi
-            .spyOn(FixedSnapshotSource.prototype, 'read')
-            .mockRejectedValueOnce(new Error('PRIVATE_TOOL_ERROR'));
+        const originalRead = FixedSnapshotSource.prototype.read;
+        let failToolRead = true;
+        const read = vi.spyOn(FixedSnapshotSource.prototype, 'read').mockImplementation(function (request, control) {
+            if (request.path === 'route.ts' && failToolRead) {
+                failToolRead = false;
+                return Promise.reject(new Error('PRIVATE_TOOL_ERROR'));
+            }
+            return originalRead.call(this, request, control);
+        });
         try {
             const result = await runReview({ ...fixtureOptions(prepared), fetch: fixtureWire(prepared) });
             const log = readFileSync(join(result.directory, 'diagnostics.jsonl'), 'utf8');
@@ -1757,7 +1790,7 @@ describe('self-contained verification contract correction', () => {
                             JSON.stringify(body).includes(
                                 kind === 'assessment_acceptance'
                                     ? 'Accept means the assessment is supported'
-                                    : 'Set suggestionAccepted=false unless',
+                                    : 'Use decision=accept_with_suggestion only',
                             )
                         )
                             correctionSeen = true;
@@ -1800,14 +1833,60 @@ function stoppedResponse() {
     );
 }
 describe('one coherent investigation and one independent check', () => {
+    it('retains valid siblings in one assessment batch and repairs only the invalid middle entry', async () => {
+        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+        const prepared = await createPreparedFixture(3);
+        const ids = prepared.state.entries.map((entry) => entry.assessmentId);
+        let sawCorrection = false;
+        const result = await runReview({
+            ...fixtureOptions(prepared),
+            fetch: fixtureWire(prepared, 'openrouter', {
+                batchAssessments: true,
+                request(body) {
+                    for (const message of body.messages) {
+                        if (message.role !== 'tool' || !message.content.startsWith('{')) continue;
+                        const feedback = JSON.parse(message.content);
+                        if (!feedback.corrections?.length) continue;
+                        expect(feedback.corrections[0].entryIndex).toBe(1);
+                        expect(feedback.newlyAccepted).toEqual(['context_1', 'context_3']);
+                        expect(feedback.remaining).toEqual(['context_2']);
+                        sawCorrection = true;
+                    }
+                },
+                mutate(phase, payload, n) {
+                    if (phase !== 'assess') return;
+                    if (n === 1) payload.assessments[1]!.checks[0]!.sourceRefs[0]!.ref = 'evidence:unknown';
+                    else {
+                        const partial = JSON.parse(
+                            readFileSync(join(dirname(prepared.statePath), 'phases/partial-assess-all-1.json'), 'utf8'),
+                        );
+                        expect(
+                            partial.output.assessments.map((p: AssessmentProposal) => p.result.assessmentId),
+                        ).toEqual([ids[0], ids[2]]);
+                        payload.assessments = [payload.assessments[1]!];
+                    }
+                },
+            }),
+        });
+        expect(sawCorrection).toBe(true);
+        expect(result.state.verification).toEqual({ expected: 3, verified: 3, complete: true });
+        expect(result.state.execution.calls).toBe(4);
+        const events = readFileSync(join(result.directory, 'diagnostics.jsonl'), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line));
+        expect(
+            events.filter((event) => event.kind === 'assessment_progress').flatMap((event) => event.data.newlyAccepted),
+        ).toEqual([ids[0], ids[2], ids[1]]);
+    });
     it('accounts for all twenty original criteria in one joint investigation, then verifies the full set once', async () => {
         vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
         const prepared = await createPreparedFixture(20),
             requests: Array<ReturnType<typeof phaseRequest>> = [];
         const result = await runReview({
             ...fixtureOptions(prepared),
-            maxParallel: 20,
             fetch: fixtureWire(prepared, 'openrouter', {
+                batchAssessments: true,
                 request(body) {
                     requests.push(phaseRequest(body, prepared));
                 },
@@ -1821,6 +1900,29 @@ describe('one coherent investigation and one independent check', () => {
         expect(requests.every((r) => r.ids.length === 20)).toBe(true);
         expect(requests.filter((r) => r.phase === 'verify')).toHaveLength(1);
         expect(result.state.execution.calls).toBe(3);
+        const assessment = requests.find((request) => request.phase === 'assess')!.payload;
+        const verification = requests.find((request) => request.phase === 'verify')!.payload;
+        expect(assessment.governingEvidence.evidence.length).toBeGreaterThanOrEqual(20);
+        expect(assessment.sourceEvidence).toBeUndefined();
+        expect(assessment.diff).toMatchObject({ status: 'complete', format: 'unified' });
+        expect(verification.diff).toEqual(assessment.diff);
+        expect(verification.sourceEvidence!.evidence.length).toBeGreaterThan(0);
+        expect(verification.governingEvidence).toEqual(assessment.governingEvidence);
+        const originals = records(prepared);
+        for (const evidence of [...assessment.governingEvidence.evidence, ...verification.sourceEvidence!.evidence]) {
+            const original = originals.find((record) => record.ref === evidence.ref);
+            expect(original).toBeDefined();
+            expect(evidence.segments.map((segment) => segment.text).join('')).toBe(original!.text);
+        }
+        for (const payload of [assessment, verification]) {
+            expect(payload.observedRuntime).toMatchObject({
+                source: 'reviewer_runtime',
+                package: '@contextrail/code-review-agent',
+                packageVersion,
+                nodeVersion: process.version,
+                comparison: { base: prepared.state.artifact.base.commit, head: prepared.state.artifact.head.commit },
+            });
+        }
     });
     it('recovers SDK parsing after 17 accepted assessments without replaying tools, then verifies all 20', async () => {
         vi.stubEnv('OPENROUTER_API_KEY', 'test-key');

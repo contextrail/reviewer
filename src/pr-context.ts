@@ -104,9 +104,32 @@ const phaseModel = z.strictObject({
     effort: text(20).optional(),
 });
 const v1 = z.strictObject({ version: z.literal(1), ...contextFields });
+const observationStatus = z.enum(['available', 'partial', 'unavailable']);
+const observedChecks = z.strictObject({
+    source: z.literal('github_api'),
+    head: sha,
+    capturedAt: z.iso.datetime(),
+    checkRuns: z.strictObject({
+        status: observationStatus,
+        items: z
+            .array(
+                z.strictObject({
+                    name: text(200),
+                    status: text(50),
+                    conclusion: text(50).nullable(),
+                }),
+            )
+            .max(50),
+    }),
+    commitStatuses: z.strictObject({
+        status: observationStatus,
+        items: z.array(z.strictObject({ context: text(200), state: text(50) })).max(50),
+    }),
+});
 const v2 = z.strictObject({
     version: z.literal(2),
     ...contextFields,
+    observedChecks: observedChecks.optional(),
     intent: z.strictObject({
         title: text(1000),
         body: text(20000),
@@ -126,7 +149,10 @@ export function parsePrContext(value: unknown, artifact: GitIdentity, reviewer: 
         if (
             context.comparison.base !== artifact.base.commit ||
             context.comparison.head !== artifact.head.commit ||
-            context.reviewer !== reviewer
+            context.reviewer !== reviewer ||
+            (context.version === 2 &&
+                context.observedChecks !== undefined &&
+                context.observedChecks.head !== context.comparison.head)
         )
             throw new Error();
         for (const item of context.discussion.items) {

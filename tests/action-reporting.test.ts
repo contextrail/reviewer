@@ -150,6 +150,11 @@ const root = process.env.REVIEW_ROOT;
 const queue = JSON.parse(fs.readFileSync(root + '/responses.json', 'utf8'));
 globalThis.fetch = async (url, options = {}) => {
  fs.appendFileSync(root + '/requests.jsonl', JSON.stringify({url,method:options.method ?? 'GET',body:options.body ? JSON.parse(options.body) : null}) + '\\n');
+ const endpoint = new URL(url).pathname;
+ if (options.method === 'GET' && endpoint === '/repos/acme/project/commits/${head}/check-runs')
+  return Response.json({total_count:0,check_runs:[]});
+ if (options.method === 'GET' && endpoint === '/repos/acme/project/commits/${head}/status')
+  return Response.json({sha:'${head}',total_count:0,statuses:[]});
  if (!queue.length) throw new Error('Unexpected request; fixture never uses the network');
  const next = queue.shift();
  return new Response(JSON.stringify(next.body), {status:next.status ?? 200,headers:{'content-type':'application/json'}});
@@ -678,6 +683,12 @@ describe('retained review history and PR context', () => {
         });
         expect(f.run('context', [{ body: [comment] }, { body: response }]).status).toBe(0);
         const context = JSON.parse(readFileSync(join(f.root, 'pr-context.json'), 'utf8'));
+        expect(context.observedChecks).toMatchObject({
+            source: 'github_api',
+            head,
+            checkRuns: { status: 'available', items: [] },
+            commitStatuses: { status: 'available', items: [] },
+        });
         expect(context.history.assessment.head).toBe(head);
         expect(context.changesSincePrevious.status).toBe('same_head');
         expect(context.discussion.status).toBe('partial');

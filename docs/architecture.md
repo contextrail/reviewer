@@ -57,11 +57,25 @@ The evidence pack focuses the review on all selected standards and prerequisites
 in either pinned Git snapshot, including unchanged supporting code. Pack read tools expose governing
 text with numbered citation segments; source read, list and search tools provide additional evidence.
 The package keeps every original criterion as a result row without creating a session per criterion.
-The independent final check evaluates the resulting set together. It can supply an evidence-backed
+Both sessions receive the original pinned governing text and the sealed unified patch when its serialized input fits 128 KiB; larger patches retain explicit pagination. They also receive a bounded read of root `AGENTS.md`, including availability and continuation metadata, as evidence of declared repository authority. Repository text cannot waive governing requirements.
+The assessment reads relevant source through the tools; verification receives those original
+source fragments, with cited records prioritized. Omitted or
+partial material remains explicitly identified and readable through the tools. These shared inputs
+are original evidence, not a substitute for independent judgment.
+The independent final check confirms the supplied assessments, challenges unsupported conclusions
+and missing obligations, and evaluates the resulting set together; it does not rebuild unchanged
+assessments. It can supply an evidence-backed
 corrected criterion result in the same pass; the original proposal and correction remain in their
 separate immutable phase records. Rejecting a finding alone never establishes a clean result.
 Supported findings are accepted individually even when another obligation in that criterion remains
 unresolved; rejected findings stay in the audit handoff rather than the published finding list.
+Uncertainty about one claim must not hide an independently established defect. Verification checks
+unresolved assessments for supported findings omitted from their own cited evidence, while requiring
+a governing obligation or maintained intended behavior that makes the observed difference a defect.
+Every criterion and proposed finding still requires an explicit decision. For unchanged accepted
+results, code reuses and revalidates the original citations and supplies confirmation text when the
+verifier has no additional explanation. Finding decisions are `accept`, `accept_with_suggestion` or
+`reject`; code derives report booleans. Corrections require explicit reasons and evidence.
 Missing decisive checks remain unresolved. Their current explanation, correction and citations come
 from verification, without retaining contradictory proposal text. A supported blocking finding still
 blocks while completeness is reported separately. No additional assessor/verifier loop is introduced.
@@ -82,18 +96,23 @@ unknown handles remain invalid. Audit artifacts retain canonical identities. Ass
 citations are derived from the checks' governing passages and source references, so the model
 does not have to repeat the same evidence in a separate result field.
 Model inputs carry citation references and source/publication locations rather than repeated report
-quotations; the full original evidence remains available through the read tools. Code supplies revision
+quotations; original evidence is supplied separately and remains available through the read tools. Code supplies revision
 metadata from the current context state. The verifier uses one complete amendment path for corrections.
 The model supplies checks, concrete findings and confidence. Code derives the aggregate finding,
 adherence, consequence and correction from those accounts, rather than asking for a second verdict.
 Canonical validators still check evidence, authority and consistency with findings.
+Code also supplies actual package/Node/model identities and fixed comparison SHAs. When GitHub
+context is collected, exact-head check/status receipts distinguish observed results from unavailable
+API access. Neither runtime identity nor passing check metadata proves package safety, deployment
+readiness or compliance with every governed requirement. Repository authority remains the pinned
+repository's declared authority, not mutable PR discussion.
 Selection failures identify the precise field and safe evidence identity in correction feedback
 and diagnostics. Source bodies stay out of routine diagnostics. Selection bounds, exact text,
 governing authority and independent verification remain enforced without extra correction rounds.
 
 ## Recovery and validation
 
-The assessment session submits one complete context result at a time. The package retains each validated
+The assessment session can submit multiple ready context results in one tool call. After the batch passes the SDK schema check, each entry is validated independently, so a citation or semantic error leaves valid siblings retained and only rejected entries need correction. The package retains each validated
 result and reports the remaining context IDs; corrections cannot overwrite an accepted result. The
 phase completes only when every assigned context is present. Retained partial progress is evidence
 of an incomplete phase, never a verified assessment or a successful review.

@@ -59,7 +59,7 @@ function validateActionConfiguration() {
         fail('invalid_configuration');
 }
 function validatePhaseModel(phase, value) {
-    if (!['plan', 'assess', 'verify'].includes(phase) || !value || typeof value !== 'object' || Array.isArray(value))
+    if (!['assess', 'verify'].includes(phase) || !value || typeof value !== 'object' || Array.isArray(value))
         throw new Error('invalid phase model');
     if (
         Object.keys(value).some((key) => !['provider', 'model', 'effort'].includes(key)) ||
@@ -92,10 +92,8 @@ function eventComparison() {
 }
 function configuration(startedAt) {
     const phaseModels = parsePhaseModels();
-    const maxParallel = e.MAX_PARALLEL || '3',
-        logLevel = e.LOG_LEVEL || 'info';
+    const logLevel = e.LOG_LEVEL || 'info';
     if (
-        !positive(maxParallel, 50) ||
         !['quiet', 'info', 'debug'].includes(logLevel) ||
         (e.INLINE_COMMENTS && !['true', 'false'].includes(e.INLINE_COMMENTS)) ||
         (e.INLINE_COMMENTS === 'true' && e.POST_COMMENT !== 'true')
@@ -114,7 +112,6 @@ function configuration(startedAt) {
         model: e.MODEL,
         effort: e.EFFORT,
         phaseModels,
-        maxParallel: Number(maxParallel),
         logLevel,
         inlineComments: e.INLINE_COMMENTS === 'true',
         maxTimeMs: e.MAX_TIME_MS,

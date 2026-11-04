@@ -112,7 +112,11 @@ Only a trusted Action revision and independently qualified npm artifact may rece
 review credentials. Disabled lifecycle scripts do not make runtime package code
 trusted. Pin every executable Action to an independently reviewed full commit SHA.
 
-Without comments, use `contents: read` and `pull-requests: read`. To post the summary,
+Without comments, use `contents: read` and `pull-requests: read`. Grant `checks: read` and
+`statuses: read` to include observed GitHub check/status receipts. These bounded receipts describe
+the exact PR head, not merge-commit validation or proof of full standards compliance. Unavailable
+API access is recorded as unavailable, never as failing tests. Check logs and output are not collected.
+To post the summary,
 set `post-comment: 'true'` and grant the review job `pull-requests: write`. The default is
 false so read-only consumers retain their existing permission boundary. Use the default
 GitHub Actions token; reruns update the matching `github-actions[bot]` comment for that

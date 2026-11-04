@@ -5,7 +5,15 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { Publication } from '../src/contracts.js';
 import { EvidenceLedger } from '../src/evidence.js';
-import { prepareEvidencePack, readPackPublication, writeEvidencePack } from '../src/pack.js';
+import {
+    modelPackEvidence,
+    modelDiffEvidence,
+    repositoryInstructionsEvidence,
+    modelSourceEvidence,
+    prepareEvidencePack,
+    readPackPublication,
+    writeEvidencePack,
+} from '../src/pack.js';
 import { digest, type PreparedState } from '../src/prepare.js';
 
 function fixture(body = 'Keep the original contract.\r\nCheck the calling boundary.\n') {
@@ -63,6 +71,100 @@ function fixture(body = 'Keep the original contract.\r\nCheck the calling bounda
 }
 
 describe('inspectable governed evidence pack', () => {
+    it('shares complete original standards and structured requirements with independently usable citations', () => {
+        const { pack, publications } = fixture();
+        const ledger = new EvidenceLedger();
+        const shared = modelPackEvidence(pack, ledger);
+        expect(shared.status).toBe('complete');
+        expect(shared.omitted).toEqual([]);
+        expect(shared.unavailable).toEqual([]);
+        expect(shared.evidence.map((record) => record.ref)).toEqual(
+            pack.index.criteria.flatMap((criterion) => criterion.sections.map((section) => section.ref)),
+        );
+        const body = shared.evidence.find((record) => record.provenance.path === '/content/body')!;
+        expect(ledger.select({ ref: body.ref, startSegment: 1, endSegment: body.segments.length }).quote).toBe(
+            publications.primary.content.body,
+        );
+        expect(
+            shared.evidence.some((record) =>
+                record.segments.some((segment) => segment.text === 'Preserve allowed alternatives.'),
+            ),
+        ).toBe(true);
+        expect(modelPackEvidence(pack, new EvidenceLedger())).toEqual(shared);
+    });
+
+    it('bounds serialized shared input and exposes exact continuations for oversized original sections', () => {
+        const original = '😀\\"\n'.repeat(60000);
+        const { pack, ledger } = fixture(original);
+        const shared = modelPackEvidence(pack, ledger);
+        expect(Buffer.byteLength(JSON.stringify(shared))).toBeLessThanOrEqual(512 * 1024);
+        expect(shared.status).toBe('incomplete');
+        expect(shared.omitted).toHaveLength(2);
+        for (const omitted of shared.omitted) {
+            expect(omitted.reason).toBe('model_evidence_budget');
+            expect(ledger.records[omitted.ref]!.text).toBe(original);
+            const page = readPackPublication(pack, ledger, omitted.next);
+            expect(page.status).toBe('truncated');
+            expect(page.sections[0]).toMatchObject({ index: omitted.next.section, offset: 0 });
+        }
+        expect(shared.evidence.some((record) => record.provenance.path === '/content/rules/0/requirement')).toBe(true);
+    });
+
+    it('reports unavailable pinned material explicitly in shared model input', () => {
+        const { state, publications, ledger } = fixture();
+        const pack = prepareEvidencePack({ state, publications: { primary: publications.primary }, ledger });
+        expect(modelPackEvidence(pack, ledger)).toMatchObject({
+            status: 'incomplete',
+            omitted: [],
+            unavailable: [{ assessmentId: 'dependency', reason: 'pinned_publication_unavailable' }],
+        });
+    });
+
+    it('shares already-read source fragments with their original status and continuation', () => {
+        const { ledger } = fixture();
+        const snapshot = { side: 'head' as const, commit: 'a'.repeat(40), tree: 'b'.repeat(40) };
+        const next = { side: 'head' as const, path: 'changed.ts', start: { line: 9, column: 0 } };
+        const record = ledger.source({
+            snapshot,
+            entry: { ...snapshot, path: 'changed.ts', object: 'c'.repeat(40), mode: '100644', kind: 'file' },
+            status: 'truncated',
+            fragments: [{ line: 8, column: 0, text: 'original source' }],
+            next,
+        })!;
+        const shared = modelSourceEvidence(ledger, [record.ref]);
+        expect(shared.evidence.map((item) => item.ref)).toEqual([record.ref]);
+        expect(shared.scope).toBe('read_fragments');
+        expect(shared.status).toBe('incomplete');
+        expect(shared.evidence[0]!.provenance).toMatchObject({ readStatus: 'truncated', next });
+        expect(shared.evidence[0]!.segments[0]!.text).toBe('original source');
+    });
+
+    it('bounds shared source records without replacing or silently truncating their original text', () => {
+        const ledger = new EvidenceLedger();
+        const huge = ledger.add('x'.repeat(600000), {
+            kind: 'source',
+            side: 'head',
+            path: 'large.ts',
+            start: { line: 1, column: 0 },
+        });
+        const small = ledger.add('exact original', {
+            kind: 'source',
+            side: 'base',
+            path: 'small.ts',
+            start: { line: 2, column: 3 },
+        });
+        const result = modelSourceEvidence(ledger, [small.ref]);
+        expect(result.evidence.map((record) => record.ref)).toEqual([small.ref]);
+        expect(result.omitted).toEqual([
+            {
+                ref: huge.ref,
+                reason: 'model_evidence_budget',
+                next: { side: 'head', path: 'large.ts', start: { line: 1, column: 0 } },
+            },
+        ]);
+        expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(512 * 1024);
+    });
+
     it('indexes the entire pinned scope and prerequisite relationships without duplicating source excerpts', () => {
         const { state, publications, ledger, pack } = fixture();
         expect(pack.index.criteria.map((entry) => entry.assessmentId)).toEqual(['primary', 'dependency']);
@@ -260,5 +362,69 @@ describe('inspectable governed evidence pack', () => {
         } finally {
             await rm(directory, { recursive: true, force: true });
         }
+    });
+});
+
+describe('sealed model diff', () => {
+    it('supplies the complete patch once, falls back explicitly on size, and rejects changed or missing sealed input', async () => {
+        const dir = await mkdtemp(join(tmpdir(), 'review-model-diff-'));
+        const hash = (value: string) => `sha256:${createHash('sha256').update(value).digest('hex')}`;
+        const fallback = {
+            status: 'truncated',
+            next: { offset: 2, patchLineOffset: 56, detectRenames: true },
+            items: [],
+        } as unknown as PreparedState['diff'];
+        try {
+            expect(await modelDiffEvidence(dir, undefined, fallback)).toMatchObject({
+                status: 'truncated',
+                fullPatch: { reason: 'artifact_unavailable' },
+            });
+            await expect(modelDiffEvidence(dir, hash('missing'), fallback)).rejects.toThrow(
+                'upstream_artifact_changed',
+            );
+            const patch = 'diff --git a/example.ts b/example.ts\n-old\n+new\n';
+            await writeFile(join(dir, 'diff.patch'), patch);
+            expect(await modelDiffEvidence(dir, hash(patch), fallback)).toEqual({
+                status: 'complete',
+                format: 'unified',
+                patch,
+                hash: hash(patch),
+            });
+            await expect(modelDiffEvidence(dir, hash('different'), fallback)).rejects.toThrow(
+                'upstream_artifact_changed',
+            );
+            const oversized = '"'.repeat(70 * 1024);
+            await writeFile(join(dir, 'diff.patch'), oversized);
+            const omitted = await modelDiffEvidence(dir, hash(oversized), fallback);
+            expect(omitted).toMatchObject({
+                ...fallback,
+                fullPatch: { reason: 'model_diff_budget', bytes: Buffer.byteLength(oversized) },
+            });
+            expect(omitted).not.toHaveProperty('patch');
+            await rm(join(dir, 'diff.patch'));
+            await writeFile(join(dir, 'other'), patch);
+            await symlink(join(dir, 'other'), join(dir, 'diff.patch'));
+            await expect(modelDiffEvidence(dir, hash(patch), fallback)).rejects.toThrow('upstream_artifact_changed');
+        } finally {
+            await rm(dir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe('repository authority evidence', () => {
+    it('keeps unavailable reads explicit and propagates cancellation', async () => {
+        const ledger = new EvidenceLedger();
+        const source = {
+            read: async () => {
+                throw new Error('private failure');
+            },
+        };
+        expect(await repositoryInstructionsEvidence(source, ledger)).toEqual({
+            status: 'unavailable',
+            next: { side: 'head', path: 'AGENTS.md' },
+            reason: 'repository_instructions_unavailable',
+            evidence: null,
+        });
+        await expect(repositoryInstructionsEvidence(source, ledger, AbortSignal.abort())).rejects.toThrow();
     });
 });

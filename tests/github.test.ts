@@ -1,3 +1,4 @@
+import { parsePrContext } from '../src/pr-context.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { digest, prepareReview } from '../src/prepare.js';
 import { runReview } from '../src/review.js';
@@ -11,6 +12,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+    collectGitHubContext,
     buildInlineReview,
     parseDiffAnchors,
     githubRequester,
@@ -1057,5 +1059,86 @@ describe('real governed run publication boundary', () => {
         await expect(publishGitHubReview({ runDir, githubDir: root, postComment: true, dryRun: true })).rejects.toThrow(
             'publication_artifact_changed',
         );
+    });
+});
+
+describe('observed exact-head GitHub checks', () => {
+    const input = { version: 1 as const, repository: 'owner/repo', pr: 1, reviewer, base, head, baseBranch: '' };
+    it('retains bounded receipts, excludes output, and separates an unavailable source from a failed check', async () => {
+        const request = vi.fn(async (path: string) => {
+            if (path.includes('/check-runs?'))
+                return {
+                    total_count: 51,
+                    check_runs: Array.from({ length: 50 }, () => ({
+                        head_sha: head,
+                        name: 'CI token-secret',
+                        status: 'completed',
+                        conclusion: 'failure',
+                        output: { text: 'private output' },
+                        details_url: 'https://example.com/private',
+                    })),
+                };
+            throw new Error('permission denied');
+        });
+        const result = await collectGitHubContext(input, {}, request, false, 'token-secret');
+        expect(result.observedChecks).toMatchObject({
+            source: 'github_api',
+            head,
+            checkRuns: {
+                status: 'partial',
+                items: Array.from({ length: 50 }, () => ({
+                    name: 'CI [REDACTED]',
+                    status: 'completed',
+                    conclusion: 'failure',
+                })),
+            },
+            commitStatuses: { status: 'unavailable', items: [] },
+        });
+        expect(JSON.stringify(result)).not.toContain('private');
+        expect(request.mock.calls.map(([path]) => path)).toEqual([
+            `/commits/${head}/check-runs?filter=latest&per_page=50`,
+            `/commits/${head}/status?per_page=50`,
+        ]);
+    });
+    it('drops foreign-head receipts and rejects a caller context whose observed head differs', async () => {
+        const result = await collectGitHubContext(
+            input,
+            {},
+            async (path) =>
+                path.includes('/check-runs?')
+                    ? {
+                          total_count: 1,
+                          check_runs: [{ head_sha: base, name: 'CI', status: 'completed', conclusion: 'success' }],
+                      }
+                    : { sha: base, total_count: 1, statuses: [{ context: 'CI', state: 'success' }] },
+            false,
+        );
+        expect(result.observedChecks).toMatchObject({
+            checkRuns: { status: 'partial', items: [] },
+            commitStatuses: { status: 'unavailable', items: [] },
+        });
+        const artifact = {
+            base: { commit: base },
+            head: { commit: head },
+            repositoryEnvironment: { status: 'unavailable' },
+        } as Parameters<typeof parsePrContext>[1];
+        expect(() => parsePrContext(result, artifact, reviewer)).not.toThrow();
+        (result.observedChecks as { head: string }).head = base;
+        expect(() => parsePrContext(result, artifact, reviewer)).toThrow('invalid_pr_context');
+    });
+    it('preserves empty available observations without inventing a passing conclusion', async () => {
+        const result = await collectGitHubContext(
+            input,
+            {},
+            async (path) =>
+                path.includes('/check-runs?')
+                    ? { total_count: 0, check_runs: [] }
+                    : { sha: head, total_count: 0, statuses: [] },
+            false,
+        );
+        expect(result.observedChecks).toMatchObject({
+            checkRuns: { status: 'available', items: [] },
+            commitStatuses: { status: 'available', items: [] },
+        });
     });
 });

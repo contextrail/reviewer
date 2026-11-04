@@ -1,14 +1,18 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { rename, rm, writeFile } from 'node:fs/promises';
+import { open, rename, rm, writeFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { publicationSchema, type Publication } from './contracts.js';
 import { EvidenceLedger, modelEvidence, type Evidence } from './evidence.js';
 import { digest, type PreparedState } from './prepare.js';
+import { SourceAccessError, type FixedSnapshotSource, type ReadRequest } from './source.js';
+import { MAX_PREPARATION_BYTES } from './git.js';
 
 const MAX_READ_BYTES = 64 * 1024;
 const MAX_READ_SEGMENTS = 200;
 const MAX_ARTIFACT_BYTES = 8 * 1024 * 1024;
+const MAX_MODEL_EVIDENCE_BYTES = 512 * 1024;
 const packReadSchema = z.strictObject({
     assessmentId: z.string().min(1),
     section: z.number().int().nonnegative().optional(),
@@ -53,6 +57,152 @@ export type PackReadResult = {
     next: PackReadRequest | null;
     reason?: string;
 };
+
+/** Reuse the sealed plain patch; source reads still supply citation evidence. */
+export async function modelDiffEvidence(directory: string, expectedHash: unknown, fallback: PreparedState['diff']) {
+    const omitted = (reason: 'artifact_unavailable' | 'model_diff_budget', bytes: number | null = null) => ({
+        ...fallback,
+        fullPatch: { status: 'omitted' as const, reason, bytes, maxBytes: 128 * 1024 },
+    });
+    if (expectedHash === undefined) return omitted('artifact_unavailable');
+    if (typeof expectedHash !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(expectedHash))
+        throw new Error('upstream_artifact_changed');
+    const file = await open(join(directory, 'diff.patch'), constants.O_RDONLY | constants.O_NOFOLLOW).catch(() => {
+        throw new Error('upstream_artifact_changed');
+    });
+    let bytes: Buffer;
+    try {
+        const info = await file.stat();
+        if (!info.isFile() || info.size > MAX_PREPARATION_BYTES) throw new Error('upstream_artifact_changed');
+        bytes = Buffer.alloc(info.size + 1);
+        const read = await file.read(bytes, 0, bytes.length, 0);
+        if (read.bytesRead !== info.size) throw new Error('upstream_artifact_changed');
+        bytes = bytes.subarray(0, info.size);
+    } finally {
+        await file.close();
+    }
+    if (`sha256:${createHash('sha256').update(bytes).digest('hex')}` !== expectedHash)
+        throw new Error('upstream_artifact_changed');
+    const patch = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    const complete = { status: 'complete' as const, format: 'unified', patch, hash: expectedHash };
+    return Buffer.byteLength(JSON.stringify(complete)) <= 128 * 1024
+        ? complete
+        : omitted('model_diff_budget', bytes.length);
+}
+
+/** Root authority text is source evidence, not permission to execute repository instructions. */
+export async function repositoryInstructionsEvidence(
+    source: Pick<FixedSnapshotSource, 'read'>,
+    ledger: EvidenceLedger,
+    signal?: AbortSignal,
+) {
+    const request = { side: 'head' as const, path: 'AGENTS.md' };
+    try {
+        signal?.throwIfAborted();
+        const read = await source.read(request, { signal });
+        const record = ledger.source(read);
+        return {
+            status: read.status,
+            next: read.next,
+            reason: read.reason ?? null,
+            evidence: record ? modelEvidence(record) : null,
+        };
+    } catch (error) {
+        if (signal?.aborted || (error instanceof SourceAccessError && error.code === 'cancelled')) throw error;
+        return {
+            status: 'unavailable' as const,
+            next: request,
+            reason: 'repository_instructions_unavailable',
+            evidence: null,
+        };
+    }
+}
+
+/** Shared original input, never assessor conclusions. Oversize sections remain explicitly readable. */
+export function modelPackEvidence(pack: EvidencePack, ledger: EvidenceLedger) {
+    const records = contents.get(pack);
+    if (!records) throw new Error('pack_invalid');
+    const result: {
+        status: 'complete' | 'incomplete';
+        evidence: ReturnType<typeof modelEvidence>[];
+        omitted: Array<{ ref: string; reason: 'model_evidence_budget'; next: PackReadRequest }>;
+        unavailable: Array<{ assessmentId: string; reason: 'pinned_publication_unavailable' }>;
+    } = { status: 'incomplete', evidence: [], omitted: [], unavailable: [] };
+    const candidates: Array<{ record: Evidence; continuation: (typeof result.omitted)[number] }> = [];
+    for (const criterion of pack.index.criteria) {
+        if (!criterion.available) {
+            result.unavailable.push({ assessmentId: criterion.assessmentId, reason: 'pinned_publication_unavailable' });
+            continue;
+        }
+        for (const [section, record] of (records.get(criterion.assessmentId) ?? []).entries()) {
+            const continuation: (typeof result.omitted)[number] = {
+                ref: record.ref,
+                reason: 'model_evidence_budget',
+                next: { assessmentId: criterion.assessmentId, section, offset: 0 },
+            };
+            candidates.push({ record, continuation });
+            result.omitted.push(continuation);
+        }
+    }
+    // Reserve every continuation first so a large body cannot crowd out omission metadata.
+    let bytes = Buffer.byteLength(JSON.stringify(result));
+    if (bytes > MAX_MODEL_EVIDENCE_BYTES) throw new Error('pack_model_metadata_too_large');
+    const included = new Set<(typeof result.omitted)[number]>();
+    for (const { record, continuation } of candidates) {
+        const view = modelEvidence(record);
+        // Conservatively retain array comma overhead; the actual serialized result stays bounded.
+        const additional =
+            Buffer.byteLength(JSON.stringify(view)) + 1 - Buffer.byteLength(JSON.stringify(continuation));
+        if (bytes + additional > MAX_MODEL_EVIDENCE_BYTES) continue;
+        bytes += additional;
+        ledger.add(record.text, structuredClone(record.provenance));
+        result.evidence.push(structuredClone(view));
+        included.add(continuation);
+    }
+    result.omitted = result.omitted.filter((continuation) => !included.has(continuation));
+    result.status = result.omitted.length || result.unavailable.length ? 'incomplete' : 'complete';
+    return result;
+}
+
+/** Original source already read during this run, with cited records first and no inferred conclusions. */
+export function modelSourceEvidence(ledger: EvidenceLedger, preferredRefs: string[] = []) {
+    const refs = [...new Set([...preferredRefs, ...Object.keys(ledger.records)])];
+    const candidates = refs
+        .map((ref) => ledger.records[ref])
+        .filter((record): record is Evidence => record?.provenance.kind === 'source');
+    const result = {
+        scope: 'read_fragments' as const,
+        status: 'incomplete' as 'complete' | 'incomplete',
+        evidence: [] as ReturnType<typeof modelEvidence>[],
+        omitted: candidates.map((record) => ({
+            ref: record.ref,
+            reason: 'model_evidence_budget' as const,
+            next: {
+                side: record.provenance.side,
+                path: record.provenance.path,
+                start: record.provenance.start,
+            } as ReadRequest,
+        })),
+    };
+    let bytes = Buffer.byteLength(JSON.stringify(result));
+    if (bytes > MAX_MODEL_EVIDENCE_BYTES) throw new Error('pack_model_metadata_too_large');
+    const included = new Set<string>();
+    for (const [index, record] of candidates.entries()) {
+        const view = modelEvidence(record);
+        const additional =
+            Buffer.byteLength(JSON.stringify(view)) + 1 - Buffer.byteLength(JSON.stringify(result.omitted[index]));
+        if (bytes + additional > MAX_MODEL_EVIDENCE_BYTES) continue;
+        bytes += additional;
+        included.add(record.ref);
+        result.evidence.push(structuredClone(view));
+    }
+    result.omitted = result.omitted.filter((record) => !included.has(record.ref));
+    result.status =
+        result.omitted.length || candidates.some((record) => record.provenance.readStatus !== 'complete')
+            ? 'incomplete'
+            : 'complete';
+    return result;
+}
 
 /** One inspectable pack of the original governed material and prepared comparison metadata. */
 export function prepareEvidencePack(options: {

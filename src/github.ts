@@ -357,6 +357,72 @@ async function retainedHistory(c: GitHubInput, request: Requester, includeHistor
         return null;
     }
 }
+// Metadata receipts only: no check output, annotations, logs, URLs or status descriptions.
+async function captureObservedChecks(c: GitHubInput, request: Requester, clip: ContextClip) {
+    const checkRuns = async () => {
+        try {
+            const raw = object(await request(`/commits/${c.head}/check-runs?filter=latest&per_page=50`));
+            if (!Array.isArray(raw.check_runs) || !Number.isInteger(raw.total_count) || Number(raw.total_count) < 0)
+                return { status: 'unavailable', items: [] };
+            const rows = objects(raw.check_runs);
+            const valid = rows.filter(
+                (row) =>
+                    row.head_sha === c.head &&
+                    typeof row.name === 'string' &&
+                    typeof row.status === 'string' &&
+                    (row.conclusion === null || typeof row.conclusion === 'string'),
+            );
+            return {
+                status:
+                    Number(raw.total_count) !== rows.length ||
+                    rows.length > 50 ||
+                    valid.length !== raw.check_runs.length
+                        ? 'partial'
+                        : 'available',
+                items: valid.slice(0, 50).map((row) => ({
+                    name: clip(row.name, 200),
+                    status: clip(row.status, 50),
+                    conclusion: row.conclusion === null ? null : clip(row.conclusion, 50),
+                })),
+            };
+        } catch {
+            return { status: 'unavailable', items: [] };
+        }
+    };
+    const commitStatuses = async () => {
+        try {
+            const raw = object(await request(`/commits/${c.head}/status?per_page=50`));
+            if (
+                raw.sha !== c.head ||
+                !Array.isArray(raw.statuses) ||
+                !Number.isInteger(raw.total_count) ||
+                Number(raw.total_count) < 0
+            )
+                return { status: 'unavailable', items: [] };
+            const rows = objects(raw.statuses);
+            const valid = rows.filter((row) => typeof row.context === 'string' && typeof row.state === 'string');
+            return {
+                status:
+                    Number(raw.total_count) !== rows.length || rows.length > 50 || valid.length !== raw.statuses.length
+                        ? 'partial'
+                        : 'available',
+                items: valid
+                    .slice(0, 50)
+                    .map((row) => ({ context: clip(row.context, 200), state: clip(row.state, 50) })),
+            };
+        } catch {
+            return { status: 'unavailable', items: [] };
+        }
+    };
+    const [checks, statuses] = await Promise.all([checkRuns(), commitStatuses()]);
+    return {
+        source: 'github_api',
+        head: c.head,
+        capturedAt: new Date().toISOString(),
+        checkRuns: checks,
+        commitStatuses: statuses,
+    };
+}
 // The Action context script loads this public entry dynamically through loadReviewerModule.
 export async function collectGitHubContext(
     c: GitHubInput,
@@ -387,6 +453,7 @@ export async function collectGitHubContext(
         capturedAt: new Date().toISOString(),
         comparison: { base: c.base, head: c.head },
         intent: { title: clip(p.title, 1000), body: clip(p.body, 20000), source: 'github_pull_request' },
+        observedChecks: await captureObservedChecks(c, request, clip),
         history: history
             ? { status: 'available', runs: history.runs, omitted: history.omitted, assessment: history.assessment }
             : { status: 'unavailable', runs: [], omitted: 0, assessment: null },

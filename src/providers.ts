@@ -20,6 +20,7 @@ export {
 export type { ProviderFailureCode } from './provider-diagnostics.js';
 
 const categories = new Set([
+    'ProviderRequestTimeout',
     'AI_APICallError',
     'AI_TypeValidationError',
     'AI_JSONParseError',
@@ -139,6 +140,13 @@ export class ProviderAccountingError extends Error {
     }
 }
 
+class ProviderRequestTimeout extends Error {
+    constructor() {
+        super('provider_request_timeout');
+        this.name = 'ProviderRequestTimeout';
+    }
+}
+
 /** Retry only failed provider operations, before any response tools execute. */
 export function recoverProviderCalls(
     model: Parameters<typeof wrapLanguageModel>[0]['model'],
@@ -153,15 +161,38 @@ export function recoverProviderCalls(
         model,
         middleware: {
             specificationVersion: 'v4',
-            wrapGenerate: async ({ doGenerate }) => {
+            wrapGenerate: async ({ model: underlying, params }) => {
                 let retries = 0;
                 for (;;) {
                     signal.throwIfAborted();
-                    let response: Awaited<ReturnType<typeof doGenerate>>;
+                    params.abortSignal?.throwIfAborted();
+                    let response: Awaited<ReturnType<typeof underlying.doGenerate>>;
                     try {
-                        response = await doGenerate();
+                        const timeout = new AbortController();
+                        const timer = setTimeout(() => timeout.abort(new ProviderRequestTimeout()), 180_000);
+                        const signals = [signal, params.abortSignal, timeout.signal].filter(
+                            (value): value is AbortSignal => value !== undefined,
+                        );
+                        try {
+                            response = await underlying.doGenerate({
+                                ...params,
+                                abortSignal: AbortSignal.any(signals),
+                            });
+                        } catch (error) {
+                            if (
+                                timeout.signal.aborted &&
+                                !signal.aborted &&
+                                !params.abortSignal?.aborted &&
+                                !accountingFailure(error)
+                            )
+                                throw new ProviderRequestTimeout();
+                            throw error;
+                        } finally {
+                            clearTimeout(timer);
+                        }
                     } catch (error) {
-                        if (signal.aborted || !recoverableProviderError(error)) throw error;
+                        if (signal.aborted || params.abortSignal?.aborted || !recoverableProviderError(error))
+                            throw error;
                         if (retries >= 2) {
                             await onRecovery('provider_retry_exhausted', retries, error);
                             throw error;
@@ -180,14 +211,20 @@ export function recoverProviderCalls(
     });
 }
 
-function recoverableProviderError(error: unknown): boolean {
+function accountingFailure(error: unknown): boolean {
     const seen = new Set<unknown>();
     let cause = error;
     while (cause instanceof Error && !seen.has(cause)) {
-        if (cause instanceof ProviderAccountingError) return false;
+        if (cause instanceof ProviderAccountingError) return true;
         seen.add(cause);
         cause = cause.cause;
     }
+    return false;
+}
+
+function recoverableProviderError(error: unknown): boolean {
+    if (accountingFailure(error)) return false;
+    if (error instanceof ProviderRequestTimeout) return true;
     // Our usage reader parses the same response before the SDK; malformed JSON can surface here directly.
     if (error instanceof SyntaxError) return true;
     if (!(error instanceof Error) || error.name !== 'AI_APICallError') return false;

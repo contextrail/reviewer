@@ -1,6 +1,6 @@
-## 1.0.0-alpha.14 (2026-11-04)
+## 1.0.0-alpha.15 (2026-11-04)
 
-### Fixes and improvements
+### Features
 
-* **reviewer:** retry public export after GitHub failure 517239a
+* **reviewer:** performance adjustments 131a381
 

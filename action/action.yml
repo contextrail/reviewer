@@ -31,13 +31,9 @@ inputs:
     required: false
     default: ''
   phase-models:
-    description: 'JSON overrides for assess/verify provider/model and optional effort; legacy plan is accepted but unused.'
+    description: 'JSON overrides for assess/verify provider/model and optional effort.'
     required: false
     default: '{}'
-  max-parallel:
-    description: 'Compatibility concurrency bound, 1-50; one selected reviewer now uses one coherent assessment session.'
-    required: false
-    default: '3'
   log-level:
     description: 'Console verbosity: quiet, info or debug. Retained safe diagnostics are always enabled.'
     required: false
@@ -129,7 +125,6 @@ runs:
         MODEL: ${{ inputs.model }}
         EFFORT: ${{ inputs.effort }}
         PHASE_MODELS: ${{ inputs.phase-models }}
-        MAX_PARALLEL: ${{ inputs.max-parallel }}
         LOG_LEVEL: ${{ inputs.log-level }}
         INLINE_COMMENTS: ${{ inputs.inline-comments }}
         POST_COMMENT: ${{ inputs.post-comment }}

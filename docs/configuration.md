@@ -41,16 +41,14 @@ for that material.
 `--provider`, `--model` and `--effort` supply the explicit shared default. Optional
 `--phase-models` JSON overrides `assess` or `verify`; an override includes provider
 and model together, plus optional effort. Omitted effort uses that provider's default.
-The legacy `plan` key is accepted but no planning model is invoked.
 Unknown keys and unsupported configuration fail without model substitution.
 
 ```sh
 --phase-models '{"verify":{"provider":"openrouter","model":"YOUR_VERIFICATION_MODEL"}}' \
-  --max-parallel 3 --log-level info
+  --log-level info
 ```
 
-`--max-parallel` remains accepted (1–50, default 3) for caller compatibility; the selected reviewer
-now uses one coherent assessment session, followed by one independent verification session.
+The selected reviewer uses one coherent assessment session, followed by one independent verification session.
 `--log-level quiet|info|debug` defaults to info; stdout retains machine JSON while safe progress
 goes to stderr. All levels retain required diagnostics. Execution limits cover the invocation,
 including bounded continuation of unfinished submissions. No stronger-model fallback is implicit.

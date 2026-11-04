@@ -328,6 +328,8 @@ export class EvidenceLedger {
                 sourceKind: result.entry.kind,
                 kind: 'source',
                 start: { line: result.fragments[0]!.line, column: result.fragments[0]!.column },
+                readStatus: result.status,
+                next: structuredClone(result.next),
             },
             result.fragments,
         );

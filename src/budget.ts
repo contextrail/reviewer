@@ -1,4 +1,4 @@
-export type ModelPhase = 'plan' | 'assess' | 'verify';
+export type ModelPhase = 'assess' | 'verify';
 export type ExecutionLimits = {
     maxTurns: number | null;
     maxOutputTokens: number | null;

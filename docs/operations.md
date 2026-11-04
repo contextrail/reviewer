@@ -68,6 +68,13 @@ Provider recovery records identify the phase, call number, retry count for that 
 and backoff in milliseconds. `provider_recovered` confirms a successful SDK response;
 `provider_retry_exhausted` means all three attempts for that request failed. Recovery does not
 mean the assessment itself passed. All requests consume the existing execution budget.
+Each non-streaming provider attempt has a 180-second deadline. On expiry, the transport is
+aborted and its rejection is awaited before the existing retry policy starts another attempt;
+completed tools and accepted criteria are not replayed. Safe recovery diagnostics identify
+`ProviderRequestTimeout`. There are still at most two retries per request, and each attempt
+consumes the original call/time/token budget. Caller cancellation and the phase deadline take
+precedence and do not trigger retries. A timeout may lack provider usage and must not be counted
+as zero cost. This deadline is fixed; it does not extend the consuming workflow's overall limit.
 
 Parser failures include a fixed `parse.code` such as `prototype_property_rejected`,
 `unexpected_end`, `unterminated_string`, `invalid_control_character`, `unexpected_token`,

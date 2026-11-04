@@ -47,7 +47,6 @@ describe('CLI configuration boundaries', () => {
     });
 
     it.each([
-        ['--max-parallel', '51', 'max-parallel must be 1..50.'],
         ['--source-read-bytes', '3', 'source-read-bytes must be >=4.'],
         ['--max-time-ms', '2147483648', 'Time limit exceeds the Node timer interval.'],
         ['--min-adherence', '3', 'min-adherence must be 0, 1 or 2.'],
@@ -60,6 +59,7 @@ describe('CLI configuration boundaries', () => {
 
     it.each([
         '{',
+        '{"plan":{"provider":"openrouter","model":"fixture"}}',
         '{"unexpected":{"provider":"openrouter","model":"fixture"}}',
         '{"assess":{"provider":"openrouter","model":"fixture","secret":"not-allowed"}}',
         '{"verify":{"provider":"invalid","model":"fixture"}}',
@@ -67,7 +67,7 @@ describe('CLI configuration boundaries', () => {
         const result = run(['review', ...comparison, '--phase-models', input]);
         expect(result.status).toBe(2);
         expect(result.stderr.trim()).toBe(
-            'phase-models must contain only plan/assess/verify provider/model/optional effort objects.',
+            'phase-models must contain only assess/verify provider/model/optional effort objects.',
         );
     });
 

@@ -26,7 +26,6 @@ function reviewArguments(c, fixed) {
         c.feedback,
     ];
     if (c.phaseModels && Object.keys(c.phaseModels).length) args.push('--phase-models', JSON.stringify(c.phaseModels));
-    if (c.maxParallel) args.push('--max-parallel', String(c.maxParallel));
     if (c.logLevel) args.push('--log-level', c.logLevel);
     if (e.PR_CONTEXT_PATH) {
         if (e.PR_CONTEXT_PATH !== join(e.REVIEW_ROOT, 'pr-context.json')) fail('invalid_configuration');

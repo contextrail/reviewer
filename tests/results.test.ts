@@ -7,7 +7,12 @@ import {
 } from '../src/assessment.js';
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';
-import { validateVerification, verificationSchema, verificationSelectionSchema } from '../src/verification.js';
+import {
+    resolveVerificationAmendments,
+    validateVerification,
+    verificationSchema,
+    verificationSelectionSchema,
+} from '../src/verification.js';
 import { reportedUsage } from '../src/providers.js';
 import {
     CitationError,
@@ -687,7 +692,7 @@ describe('model verification acceptance contract', () => {
         citations: [],
         missingChecks: [],
         amendment: null,
-        findings: [{ findingId: 'finding_1', accepted: true, suggestionAccepted: false, explanation: 'Supported.' }],
+        findings: [{ findingId: 'finding_1', decision: 'accept', explanation: null }],
     };
     it('accepts supported findings without a competing correction or unresolved checks', () => {
         expect(verificationSelectionSchema.safeParse({ entries: [verdict] }).success).toBe(true);
@@ -709,7 +714,8 @@ describe('model verification acceptance contract', () => {
                 citations: [check.passage, ...check.sourceRefs],
                 findings: [
                     {
-                        ...verdict.findings[0],
+                        explanation: 'Supported.',
+                        suggestionAccepted: false,
                         findingId: proposal.findings[0]!.findingId,
                         accepted: field !== 'rejectedFinding',
                     },
@@ -723,7 +729,7 @@ describe('model verification acceptance contract', () => {
         },
     );
     it('rejects the obsolete model resolution field while canonical records still accept it', () => {
-        const input = { entries: [{ ...verdict, disposition: 'revise', resolution: fixture().input }] };
+        const input = { entries: [{ ...verdict, findings: [], disposition: 'revise', resolution: fixture().input }] };
         expect(verificationSchema.safeParse(input).success).toBe(true);
         expect(verificationSelectionSchema.safeParse(input).success).toBe(false);
     });
@@ -735,10 +741,70 @@ describe('model verification acceptance contract', () => {
                         ...verdict,
                         disposition: 'unresolved',
                         missingChecks: ['Inspect another surface.'],
-                        findings: [{ ...verdict.findings[0], accepted: false }],
+                        findings: [{ ...verdict.findings[0], decision: 'reject', explanation: 'Unsupported.' }],
                     },
                 ],
             }).success,
         ).toBe(true);
+    });
+});
+
+describe('compact verification expansion', () => {
+    function setup() {
+        const { result, check, finding, entries, ledger } = modelAssessmentFixture();
+        entries[0]!.contentHash = digest(publication.content);
+        const assessment = deriveAssessmentCitations(
+            { assessments: [{ result, checks: [check], findings: [finding] }] },
+            entries,
+        );
+        const proposal = validateReviewSubmission({ assessments: [assessment] }, entries, ledger);
+        const verdict = {
+            assessmentId: proposal.result.assessmentId,
+            disposition: 'accept',
+            reason: null,
+            citations: [],
+            missingChecks: [],
+            amendment: null,
+            findings: [{ findingId: proposal.findings[0]!.findingId, decision: 'accept', explanation: null }],
+        };
+        const expand = (value: unknown) => resolveVerificationAmendments({ entries: [value] }, entries, [proposal]);
+        const validate = (value: unknown) => validateVerification(expand(value), [proposal], ledger, entries);
+        return { verdict, proposal, expand, validate, ledger, entries };
+    }
+    it('references known evidence while requiring explicit finding decisions', () => {
+        const { verdict, proposal, validate } = setup();
+        const [accepted] = validate(verdict);
+        expect(accepted!.citations).toEqual(proposal.result.citations);
+        expect(accepted!.findings[0]).toMatchObject({ accepted: true, suggestionAccepted: false });
+        expect(() => validate({ ...verdict, findings: [] })).toThrow();
+        expect(() => validate({ ...verdict, assessmentId: 'foreign' })).toThrow('foreign_assessment_id');
+    });
+    it('never accepts an omitted assessment or an unproposed patch', () => {
+        const { verdict, proposal, validate, ledger, entries } = setup();
+        expect(() => validateVerification({ entries: [] }, [proposal], ledger, entries)).toThrow();
+        expect(() =>
+            validate({ ...verdict, findings: [{ ...verdict.findings[0], decision: 'accept_with_suggestion' }] }),
+        ).toThrow('unproposed_suggestion_acceptance');
+    });
+    it('requires correction evidence and rejection explanations', () => {
+        const { verdict, expand } = setup();
+        expect(() => expand({ ...verdict, disposition: 'unresolved' })).toThrow(
+            'verification_correction_evidence_required',
+        );
+        expect(() => expand({ ...verdict, findings: [{ ...verdict.findings[0], decision: 'reject' }] })).toThrow(
+            'verification_rejection_explanation_required',
+        );
+    });
+    it('keeps supported findings alongside separately unresolved checks', () => {
+        const { verdict, proposal, validate } = setup();
+        const [unresolved] = validate({
+            ...verdict,
+            disposition: 'unresolved',
+            reason: 'Boundary still uninspected.',
+            citations: proposal.result.citations.map(({ ref, quote, start, end }) => ({ ref, quote, start, end })),
+            missingChecks: ['Inspect the consequential boundary.'],
+        });
+        expect(unresolved!.disposition).toBe('unresolved');
+        expect(unresolved!.findings[0]!.accepted).toBe(true);
     });
 });
