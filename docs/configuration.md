@@ -56,11 +56,11 @@ including bounded continuation of unfinished submissions. No stronger-model fall
 ## Limits and environment aliases
 
 `--purpose TEXT` records your stated objective or stage for the reviewer.
-Every option in this section, plus provider, model, effort, min-adherence,
-min-confidence, advisory, feedback and repository-attribution, has the environment
+Every option in this section, plus provider, model, effort, enforcement, feedback and repository-attribution, has the environment
 form `CONTEXTRAIL_REVIEW_<UPPERCASE_FLAG_WITH_UNDERSCORES>`; CLI values override it.
-For example, `--max-turns` maps to `CONTEXTRAIL_REVIEW_MAX_TURNS`. Advisory and
-repository-attribution environment values must be `true` or `false`. Git arguments
+For example, `--max-turns` maps to `CONTEXTRAIL_REVIEW_MAX_TURNS`.
+`CONTEXTRAIL_REVIEW_ENFORCEMENT` accepts `advisory` (default), `required`, or `strict`.
+Repository-attribution environment values must be `true` or `false`. Git arguments
 and reviewer ID have no environment aliases. See `--help` for the current flag list.
 
 | Flag                                                    | Default / unit                                                                                                                                        |
@@ -80,4 +80,4 @@ timers use 1..2147483647 ms. Unset execution limits still leave provider constra
 The observed token limit can overshoot by one call and is not a dollar ceiling.
 Workflow timeouts are separate; leave time for finalization and upload.
 
-See [review policy](review-results.md#interpret-judgments-and-exit-codes) for adherence, confidence and advisory settings, and [recovery](architecture.md#recovery-and-validation) for retry semantics.
+See [review policy](review-results.md#interpret-judgments-and-exit-codes) for the three enforcement modes, and [recovery](architecture.md#recovery-and-validation) for retry semantics.

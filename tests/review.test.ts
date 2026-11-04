@@ -547,6 +547,7 @@ const fixtureOptions = (prepared: FixturePrepared) => ({
     prepared,
     provider: { provider: 'openrouter' as const, model: 'fixture-model' },
     logLevel: 'quiet' as const,
+    policy: { enforcement: 'required' as const },
     feedback: 'off' as const,
 });
 
@@ -1092,35 +1093,61 @@ describe('governed phase execution through actual SDK provider wires', () => {
             expect(JSON.parse(readFileSync(result.reportPath, 'utf8'))).toEqual(result.state);
         },
     );
-    it('checks every clean and nonapplicable judgment rather than only filtering findings', async () => {
-        vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
-        const prepared = await preparedFixture();
-        const result = await runReview({
-            ...fixtureOptions(prepared),
-            fetch: fixtureWire(prepared, 'openrouter', {
-                mutate(phase, payload) {
-                    if (phase === 'assess')
-                        for (const a of payload.assessments) {
-                            a.result.adherence = 2;
-                            a.result.finding = 'none';
-                            a.result.consequence = '';
-                            a.result.correction = '';
-                            a.findings = [];
-                        }
-                    if (phase === 'verify')
-                        for (const e of payload.entries) {
-                            e.disposition = 'unresolved';
-                            e.reason = 'Missing original requirement investigation.';
-                            e.missingChecks = ['Authorization on alternate path.'];
-                        }
-                },
-            }),
-        });
-        expect(result.state.reviewStatus).toBe('incomplete');
-        expect(result.state.verification.verified).toBe(0);
-        expect(result.state.entries.every((e) => e.result.disposition === 'unresolved')).toBe(true);
-        expect(result.state.phases.filter((p) => p.phase === 'verify')).toHaveLength(1);
-    });
+    it.each([undefined, 'advisory', 'required', 'strict'] as const)(
+        'applies %s enforcement to supported findings without changing them',
+        async (enforcement) => {
+            vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+            const prepared = await preparedFixture();
+            const result = await runReview({
+                ...fixtureOptions(prepared),
+                policy: enforcement ? { enforcement } : undefined,
+                fetch: fixtureWire(prepared, 'openrouter'),
+            });
+            expect(result.state.decision?.exitCode).toBe(
+                enforcement === 'required' || enforcement === 'strict' ? 1 : 0,
+            );
+            expect(
+                result.state.findings.some(
+                    (finding) => finding.verified && finding.classification === 'binding_violation',
+                ),
+            ).toBe(true);
+            expect(result.state.execution.policy.enforcement).toBe(enforcement ?? 'advisory');
+        },
+    );
+    it.each(['advisory', 'required', 'strict'] as const)(
+        'retains verified evidence gaps under %s enforcement',
+        async (enforcement) => {
+            vi.stubEnv('OPENROUTER_API_KEY', 'test-key');
+            const prepared = await preparedFixture();
+            const result = await runReview({
+                ...fixtureOptions(prepared),
+                policy: { enforcement },
+                fetch: fixtureWire(prepared, 'openrouter', {
+                    mutate(phase, payload) {
+                        if (phase === 'assess')
+                            for (const a of payload.assessments) {
+                                a.result.adherence = 2;
+                                a.result.finding = 'none';
+                                a.result.consequence = '';
+                                a.result.correction = '';
+                                a.findings = [];
+                            }
+                        if (phase === 'verify')
+                            for (const e of payload.entries) {
+                                e.disposition = 'unresolved';
+                                e.reason = 'Missing original requirement investigation.';
+                                e.missingChecks = ['Authorization on alternate path.'];
+                            }
+                    },
+                }),
+            });
+            expect(result.state.decision?.exitCode).toBe(enforcement === 'strict' ? 1 : 0);
+            expect(result.state.reviewStatus).toBe('incomplete');
+            expect(result.state.verification.verified).toBe(0);
+            expect(result.state.entries.every((e) => e.result.disposition === 'unresolved')).toBe(true);
+            expect(result.state.phases.filter((p) => p.phase === 'verify')).toHaveLength(1);
+        },
+    );
     it.each([
         ['Key spending limit exceeded', 'provider_credit_limit', 403],
         ['Request forbidden', 'provider_permission_denied', 403],
@@ -2579,7 +2606,9 @@ describe('one coherent investigation and one independent check', () => {
         expect(result.state.phases.map((p) => p.phase)).toEqual(['assess', 'verify']);
         expect(result.state.verification.verified).toBe(0);
         expect(result.state.findings.every((f) => !f.verified)).toBe(true);
-        expect(result.state.decision?.exitCode).toBe(2);
+        expect(result.state.reviewStatus).toBe('incomplete');
+        expect(result.state.entries.every((entry) => entry.result.disposition === 'unresolved')).toBe(true);
+        expect(result.state.decision?.exitCode).toBe(0);
     });
     it('resumes a sealed failed verifier without repeating the complete investigation and rejects mutated checkpoints', async () => {
         vi.stubEnv('OPENROUTER_API_KEY', 'test-key');

@@ -88,9 +88,7 @@ export function projectReviewReport(state: ReviewState, repositoryAttribution = 
         })),
         runner: {
             policy: {
-                minAdherence: e.policy.minAdherence,
-                minConfidence: e.policy.minConfidence,
-                advisory: e.policy.advisory,
+                enforcement: e.policy.enforcement,
             },
             reviewExit: state.decision.reviewExit,
             exitCode: state.decision.exitCode,

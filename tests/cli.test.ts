@@ -46,10 +46,26 @@ describe('CLI configuration boundaries', () => {
         expect(result.stderr.trim()).toBe(unresolvedGit);
     });
 
+    it.each(['advisory', 'required', 'strict'])('accepts %s from CLI and environment with CLI precedence', (mode) => {
+        expect(run(['review', ...comparison], { CONTEXTRAIL_REVIEW_ENFORCEMENT: mode }).stderr.trim()).toBe(
+            unresolvedGit,
+        );
+        expect(
+            run(['review', ...comparison, '--enforcement', mode], {
+                CONTEXTRAIL_REVIEW_ENFORCEMENT: 'invalid',
+            }).stderr.trim(),
+        ).toBe(unresolvedGit);
+    });
+    it('rejects obsolete policy environment rather than silently changing enforcement', () => {
+        const result = run(['review', ...comparison], { CONTEXTRAIL_REVIEW_ADVISORY: 'false' });
+        expect(result.status).toBe(2);
+        expect(result.stderr).toContain('was replaced by CONTEXTRAIL_REVIEW_ENFORCEMENT');
+    });
+
     it.each([
         ['--source-read-bytes', '3', 'source-read-bytes must be >=4.'],
         ['--max-time-ms', '2147483648', 'Time limit exceeds the Node timer interval.'],
-        ['--min-adherence', '3', 'min-adherence must be 0, 1 or 2.'],
+        ['--enforcement', 'sometimes', 'enforcement must be advisory, required or strict.'],
         ['--feedback', 'sometimes', 'feedback must be send or off.'],
     ])('rejects invalid %s before repository/network work', (flag, value, message) => {
         const result = run(['review', ...comparison, flag, value]);

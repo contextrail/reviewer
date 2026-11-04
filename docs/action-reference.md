@@ -6,23 +6,24 @@ Look up a specific setting here. For a first integration, use [GitHub Actions se
 
 ## Inputs and credentials
 
-| Input                                  | Contract                                                                                                                                                  |
-| -------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `package-version`                      | Required exact published npm SemVer. No tags, ranges, URLs, local builds or unavailable-version fallback.                                                 |
-| `pr-number`, `base-branch`             | Required PR number; optional expected target branch.                                                                                                      |
-| `reviewer`                             | Required reusable published `skill://` ID; never an execution or repository ID.                                                                           |
-| `mcp-url`, `mcp-org-id`                | Required HTTPS endpoint and organization scope, using CLI connection vocabulary.                                                                          |
-| `provider`, `model`                    | Required `openai` or `openrouter` and explicit provider-native model. No fallback.                                                                        |
-| `effort`                               | Optional CLI effort; empty delegates to provider default.                                                                                                 |
-| `max-time-ms`                          | Required positive workflow model deadline, at most 2147483647 ms. Does not bound total job time.                                                          |
-| `feedback`                             | `send` (default) or `off`; CLI owns report submission and its status.                                                                                     |
-| `repository-attribution`               | `true` or `false` (default); explicitly includes repository identity in CLI retrieval/reporting.                                                          |
-| `artifact-retention-days`              | 1–90, default 7, within repository/organization retention policy.                                                                                         |
-| `post-comment`                         | `false` by default; `true` creates/updates the bot PR summary. Requires `pull-requests: write`.                                                           |
-| `pr-context`                           | `false` by default; collect bounded PR discussion/history for a matching CLI release supporting `--pr-context`. Sends that context to the selected model. |
-| `github-token`                         | Defaults to `github.token`; Git/API reads, plus PR comment writes when enabled.                                                                           |
-| `mcp-auth-token`                       | Required bearer credential; map from `secrets.CONTEXTRAIL_MCP_AUTH_TOKEN`.                                                                                |
-| `openai-api-key`, `openrouter-api-key` | Supply the selected provider's credential from its named secret.                                                                                          |
+| Input                                  | Contract                                                                                                                                                          |
+| -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `package-version`                      | Required exact published npm SemVer. No tags, ranges, URLs, local builds or unavailable-version fallback.                                                         |
+| `pr-number`, `base-branch`             | Required PR number; optional expected target branch.                                                                                                              |
+| `reviewer`                             | Required reusable published `skill://` ID; never an execution or repository ID.                                                                                   |
+| `mcp-url`, `mcp-org-id`                | Required HTTPS endpoint and organization scope, using CLI connection vocabulary.                                                                                  |
+| `provider`, `model`                    | Required `openai` or `openrouter` and explicit provider-native model. No fallback.                                                                                |
+| `enforcement`                          | `advisory` (default), `required`, or `strict`. See the [outcome table](review-results.md#interpret-judgments-and-exit-codes); execution failures always return 2. |
+| `effort`                               | Optional CLI effort; empty delegates to provider default.                                                                                                         |
+| `max-time-ms`                          | Required positive workflow model deadline, at most 2147483647 ms. Does not bound total job time.                                                                  |
+| `feedback`                             | `send` (default) or `off`; CLI owns report submission and its status.                                                                                             |
+| `repository-attribution`               | `true` or `false` (default); explicitly includes repository identity in CLI retrieval/reporting.                                                                  |
+| `artifact-retention-days`              | 1–90, default 7, within repository/organization retention policy.                                                                                                 |
+| `post-comment`                         | `false` by default; `true` creates/updates the bot PR summary. Requires `pull-requests: write`.                                                                   |
+| `pr-context`                           | `false` by default; collect bounded PR discussion/history for a matching CLI release supporting `--pr-context`. Sends that context to the selected model.         |
+| `github-token`                         | Defaults to `github.token`; Git/API reads, plus PR comment writes when enabled.                                                                                   |
+| `mcp-auth-token`                       | Required bearer credential; map from `secrets.CONTEXTRAIL_MCP_AUTH_TOKEN`.                                                                                        |
+| `openai-api-key`, `openrouter-api-key` | Supply the selected provider's credential from its named secret.                                                                                                  |
 
 Additional optional inputs: `phase-models` (JSON, default `{}`),
 `log-level` (`quiet|info|debug`, default `info`) and `inline-comments` (default `false`,

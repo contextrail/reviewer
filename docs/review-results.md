@@ -20,8 +20,7 @@ criterion with no findings receives 2; one with findings receives 0. Models no l
 author a separate adherence score or aggregate finding claim. Score 1 remains readable
 in historical records. Aggregate classification, consequence and correction come from
 the actual findings, and independent verification still determines whether they are accepted.
-For new reviews, `--min-adherence 1` and `--min-adherence 2` therefore have the same effect:
-both also block supported guidance departures. Without an adherence threshold, those remain advisory.
+Guidance departures remain advisory in every enforcement mode. Scores describe the judgment; they do not add configurable numerical gates.
 
 A criterion can contain both supported findings and unresolved obligations. Its overall
 judgment remains unresolved with null scores; the independently verified findings remain
@@ -35,20 +34,31 @@ entries have null adherence and may have confidence. Missing evidence is not a
 violation or a zero. Citations establish where evidence came from; they do not
 prove the model interpreted it correctly.
 
-| Option                     | Policy effect                                                                                                                                                                       |
-| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--min-adherence 0\|1\|2`  | Adds a gate for evaluated applicable entries below this threshold. Binding violations and behavioral defects still block at lower thresholds. Omitted: no numerical adherence gate. |
-| `--min-confidence 1\|2\|3` | Low or unavailable confidence makes an entry incomplete, including a not-applicable judgment. Independently verified blocking findings still block. Omitted: no confidence gate.    |
-| `--advisory`               | Keeps findings but suppresses finding/adherence blockers. Unresolved scope, confidence shortfalls and execution/report failures still prevent success.                              |
+Choose one setting: `--enforcement advisory|required|strict` (default `advisory`), or the Action's `enforcement` input.
 
-By default, supported binding violations and behavioral defects block. A
-discretionary Guidance departure alone does not block without an adherence gate.
+| Recorded outcome                                                 | advisory | required | strict |
+| ---------------------------------------------------------------- | -------- | -------- | ------ |
+| Verified binding violation or behavioral defect                  | 0        | 1        | 1      |
+| Evidence gap, with no supported violation or defect              | 0        | 0        | 1      |
+| No violations, defects or evidence gaps                          | 0        | 0        | 0      |
+| Execution failed or required usable report could not be produced | 2        | 2        | 2      |
 
-| Review exit | Meaning                                                                                                                                      |
-| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| **0**       | Completed bounded review accepted by the effective policy.                                                                                   |
-| **1**       | At least one supported qualifying blocker. Other unresolved or unexamined entries can remain; inspect completion and scope even with exit 1. |
-| **2**       | Incomplete review without a qualifying blocker, invalid configuration, execution failure, or failure to produce the required usable report.  |
+The first three rows require the reviewer to finish its assessment and verification workflow.
+A finished workflow may conclude that evidence is missing: that is an unresolved judgment,
+not a failed execution. A timeout, invalid handoff or unexamined work is still an execution failure.
+
+**Advisory** reports findings without a policy gate. Leave the review job optional in branch
+protection if you want no required check. **Required** blocks supported rule violations and
+behavioral defects. **Strict** additionally blocks unresolved evidence. Guidance departures
+remain suggestions. No mode changes what gets assessed, verified, displayed or retained.
+
+Exit **0** means policy permits continuation, not that every rule was satisfied or every
+question resolved. Exit **1** means the chosen policy requires attention. Exit **2** means
+execution failed. Read the recorded assessment completion and unresolved criteria alongside the exit.
+
+The effective policy is retained with each run. New reports use `{ "enforcement": "advisory" }`
+(or `required` / `strict`); deploy the API's updated report contract before enabling feedback
+from this reviewer release. Historical reports keep their original policy and are not reclassified.
 
 An execution or required local-report failure returns 2 even when an earlier
 blocker exists; `decision.reviewExit` preserves the underlying review judgment

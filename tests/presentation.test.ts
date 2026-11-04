@@ -60,6 +60,28 @@ const state = {
     },
 };
 describe('governed presentation', () => {
+    it.each(['advisory', 'required', 'strict'])('shows %s policy without hiding evidence gaps', (enforcement) => {
+        const input = {
+            ...state,
+            findings: [],
+            entries: [state.entries[1]],
+            execution: { ...state.execution, policy: { enforcement } },
+            decision: { reviewExit: enforcement === 'strict' ? 1 : 0 },
+        };
+        const body = renderReviewComment(input);
+        const visible = body.split('<details>')[0]!;
+        expect(visible).toContain(`Enforcement: **${enforcement}**`);
+        expect(visible).toContain('Runtime evidence is unavailable');
+        expect(visible).not.toContain('Blocking findings');
+        expect(visible.toLowerCase()).toContain('assessment incomplete');
+        expect(renderActionSummary(input)).toContain(`Enforcement: **${enforcement}**`);
+    });
+    it('keeps verified findings visible under advisory exit zero and execution failures distinct', () => {
+        const input = { ...state, execution: { ...state.execution, policy: { enforcement: 'advisory' } } };
+        expect(renderReviewComment(input, { reviewExit: 0 })).toContain('Restore the accepted field');
+        expect(renderReviewComment(input, { reviewExit: 2 })).toContain('Execution did not finish');
+    });
+
     it('leads with governed findings and coverage while details stay collapsed', () => {
         const body = renderReviewComment(state);
         expect(body.indexOf('Governed findings')).toBeLessThan(body.indexOf('Assessment coverage'));

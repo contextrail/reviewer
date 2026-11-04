@@ -599,6 +599,24 @@ function renderGovernedFindings(
         lines.push(`${groups.length - 15} additional source-range accounts are in the full report.`);
     return lines;
 }
+function reviewHeadline(
+    execution: Record<string, unknown>,
+    options: PresentationOptions,
+    completion: string,
+    reviewExit: unknown,
+    enforcement: string,
+): string {
+    if (
+        options.failedStage ||
+        (reviewExit === 2 && enforcement !== 'legacy / unavailable') ||
+        (execution.stopReason && execution.stopReason !== 'finished')
+    )
+        return 'Execution did not finish';
+    if (reviewExit === 1)
+        return 'Policy requires attention' + (completion !== 'complete' ? '; assessment incomplete' : '');
+    return completion !== 'complete' ? 'Assessment incomplete' : 'Bounded assessment complete';
+}
+
 export function renderReviewComment(input: unknown, options: PresentationOptions = {}): string {
     const state = object(input),
         execution = object(state.execution),
@@ -611,18 +629,13 @@ export function renderReviewComment(input: unknown, options: PresentationOptions
     const findings = objects(state.findings);
     const verified = findings.filter((f) => f.verified === true);
     const completion = string(state.reviewStatus, 'unknown');
-    const reviewExit = options.reviewExit ?? decision.reviewExit ?? decision.exitCode;
-    const health =
-        options.failedStage || (execution.stopReason && execution.stopReason !== 'finished')
-            ? 'Execution did not finish'
-            : reviewExit === 1
-              ? 'Blocking findings' + (completion !== 'complete' ? '; assessment incomplete' : '')
-              : completion !== 'complete'
-                ? 'Assessment incomplete'
-                : 'Bounded assessment complete';
+    const reviewExit = options.reviewExit ?? decision.exitCode ?? decision.reviewExit;
+    const enforcement = string(object(execution.policy).enforcement, 'legacy / unavailable');
+    const health = reviewHeadline(execution, options, completion, reviewExit, enforcement);
     const lines = [
         '### ContextRail governed review',
         `**${health}.**`,
+        `Enforcement: **${markdownText(enforcement)}** · Exit: ${markdownText(reviewExit ?? 'unavailable')}. Exit 0 means policy permits continuation; inspect findings and evidence gaps below.`,
         `${markdownText(reviewer.title ?? reviewer.nodeId)} @ ${markdownText(reviewer.version)} · Head ${markdownText(object(artifact.head).commit)}.`,
         `Run ID: ${markdownText(state.runId)}.`,
     ];

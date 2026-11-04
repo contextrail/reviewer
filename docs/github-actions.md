@@ -30,6 +30,7 @@ Select an independently reviewed public Action SHA and an exact qualified npm ve
       provider: openai
       model: ${{ vars.REVIEW_MODEL }}
       effort: ${{ vars.REVIEW_EFFORT || 'medium' }}
+      enforcement: ${{ vars.REVIEW_ENFORCEMENT || 'advisory' }}
       phase-models: >-
           {"verify":{"provider":"openai","model":${{ toJSON(vars.VERIFY_MODEL || vars.REVIEW_MODEL) }},"effort":${{ toJSON(vars.VERIFY_EFFORT || vars.REVIEW_EFFORT || 'medium') }}}}
       max-time-ms: '600000'
@@ -122,10 +123,17 @@ false so read-only consumers retain their existing permission boundary. Use the 
 GitHub Actions token; reruns update the matching `github-actions[bot]` comment for that
 reviewer. Other users' comments are never edited. Superseded comparisons and older runs
 cannot replace a newer comment. No labels or Slack messages are written.
-Keep this check optional by omitting it from branch protection/ruleset required checks.
-The `review-exit` output preserves CLI exit 0/1/2: do not add `continue-on-error` or advisory
-mode to make it green. If enforcement is wanted later, require the check through
-branch policy; failure semantics remain unchanged.
+Choose `enforcement: advisory|required|strict` explicitly or use the default `advisory`.
+Advisory preserves findings and evidence questions without failing for them; execution failures
+still return 2. Required fails for supported violations/defects; strict also fails for evidence gaps.
+Use branch protection to make a required/strict check a merge requirement. Leave advisory optional
+if you want no required check. Avoid `continue-on-error`, which would hide execution failures too.
+See the [outcome table](review-results.md#interpret-judgments-and-exit-codes).
+
+The monorepo's `REVIEW_ENFORCEMENT` repository variable selects the mode, defaulting to advisory.
+This input requires both the new published Action SHA and the matching CLI release; the retained
+alpha.15 Action pin does not support it. After publishing, update both pins before testing the mode.
+Deploy the updated API report contract before sending feedback with the new policy shape.
 
 ## Qualify and operate a consumer
 

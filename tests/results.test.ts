@@ -195,41 +195,69 @@ describe('settled policy is separate from judgment', () => {
         entries[0]!.result.confidence = confidence as 1 | 2 | 3 | null;
         return entries[0]!;
     }
-    it('applies thresholds, advisory and supported blocker precedence without changing results', () => {
-        const blocker = entry('binding_violation', 0),
-            advice = entry('guidance_departure', 1),
-            satisfied = entry(),
-            unexamined = fixture().entries[0]!;
-        const before = JSON.stringify(blocker);
-        expect(decideExit([blocker, unexamined], DEFAULT_POLICY).reviewExit).toBe(1);
-        expect(decideExit([blocker, unexamined], { ...DEFAULT_POLICY, advisory: true }).reviewExit).toBe(2);
-        expect(decideExit([blocker], { ...DEFAULT_POLICY, advisory: true }).reviewExit).toBe(0);
-        expect(decideExit([blocker], { ...DEFAULT_POLICY, minAdherence: 0 }).reviewExit).toBe(1);
-        expect(decideExit([advice], DEFAULT_POLICY).reviewExit).toBe(0);
-        expect(decideExit([advice], { ...DEFAULT_POLICY, minAdherence: 2 }).reviewExit).toBe(1);
-        expect(decideExit([advice], { ...DEFAULT_POLICY, minAdherence: 1 }).reviewExit).toBe(0);
-        expect(decideExit([satisfied], { ...DEFAULT_POLICY, minConfidence: 3, minAdherence: 2 }).reviewExit).toBe(0);
-        expect(decideExit([entry('binding_violation', 0, 1)], { ...DEFAULT_POLICY, minConfidence: 2 }).reviewExit).toBe(
-            2,
-        );
-        expect(
-            decideExit([entry('binding_violation', 0, null), blocker], { ...DEFAULT_POLICY, minConfidence: 3 })
-                .reviewExit,
-        ).toBe(1);
-        expect(JSON.stringify(blocker)).toBe(before);
-    });
-    it('keeps execution failure separate from a blocker and applies confidence to nonapplicability', () => {
-        const blocker = entry('behavioral_defect', 1);
-        expect(decideExit([blocker], DEFAULT_POLICY, true, true)).toMatchObject({ exitCode: 2, reviewExit: 1 });
-        const e = entry();
-        e.result = {
-            ...(e.result as Exclude<typeof e.result, { disposition: 'not_evaluated' }>),
-            disposition: 'not_applicable',
+    it.each([
+        ['advisory', 0, 0],
+        ['required', 1, 0],
+        ['strict', 1, 1],
+    ] as const)('applies %s without changing judgments', (enforcement, violationExit, gapExit) => {
+        const violation = entry('binding_violation', 0);
+        const defect = entry('behavioral_defect', 1);
+        const advice = entry('guidance_departure', 1);
+        const gap = entry();
+        gap.result = {
+            ...gap.result,
+            disposition: 'unresolved',
             adherence: null,
             confidence: null,
-        };
-        expect(decideExit([e], DEFAULT_POLICY).exitCode).toBe(0);
-        expect(decideExit([e], { ...DEFAULT_POLICY, minConfidence: 1 }).exitCode).toBe(2);
+        } as typeof gap.result;
+        const inputs = [violation, defect, advice, gap];
+        const before = JSON.stringify(inputs);
+        const policy = { enforcement };
+        for (const issue of [violation, defect]) {
+            expect(decideExit([issue], policy)).toMatchObject({
+                exitCode: violationExit,
+                reviewExit: violationExit,
+                complete: true,
+            });
+            expect(decideExit([issue, gap], policy)).toMatchObject({ exitCode: violationExit, complete: false });
+        }
+        expect(decideExit([gap], policy)).toMatchObject({ exitCode: gapExit, reviewExit: gapExit, complete: false });
+        expect(decideExit([entry(), advice], policy)).toMatchObject({ exitCode: 0, complete: true });
+        expect(decideExit([gap], policy).reasons[0]?.blocking).toBe(enforcement === 'strict');
+        expect(JSON.stringify(inputs)).toBe(before);
+    });
+    it.each(['advisory', 'required', 'strict'] as const)(
+        'keeps missing execution coverage an error in %s',
+        (enforcement) => {
+            const policy = { enforcement };
+            expect(decideExit([], policy).exitCode).toBe(2);
+            expect(decideExit(fixture().entries, policy).exitCode).toBe(2);
+            expect(decideExit([entry()], policy, true, true)).toMatchObject({ exitCode: 2, complete: false });
+            const issue = entry('behavioral_defect', 1);
+            expect(decideExit([issue], policy, false, true)).toMatchObject({
+                exitCode: 2,
+                reviewExit: enforcement === 'advisory' ? 0 : 1,
+            });
+        },
+    );
+    it('defaults to advisory and retains verified findings on unresolved criteria', () => {
+        expect(DEFAULT_POLICY).toEqual({ enforcement: 'advisory' });
+        const gap = entry();
+        gap.result = {
+            ...gap.result,
+            disposition: 'unresolved',
+            adherence: null,
+            confidence: null,
+        } as typeof gap.result;
+        const finding = { verified: true, classification: 'behavioral_defect', assessmentIds: [gap.assessmentId] };
+        expect(decideExit([gap], { enforcement: 'required' }, false, false, [finding])).toMatchObject({
+            exitCode: 1,
+            complete: false,
+        });
+        expect(
+            decideExit([gap], { enforcement: 'required' }, false, false, [{ ...finding, verified: false }]).exitCode,
+        ).toBe(0);
+        expect(decideExit([gap], DEFAULT_POLICY, false, false, [finding]).exitCode).toBe(0);
     });
 });
 

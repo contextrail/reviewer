@@ -227,7 +227,7 @@ describe('Action health summary', () => {
         const f = fixture();
         expect(f.run('summary').status).toBe(0);
         const md = f.markdown();
-        expect(md).toContain('Blocking findings; assessment incomplete');
+        expect(md).toContain('Policy requires attention; assessment incomplete');
         expect(md).toContain('0m 12.3s');
         expect(md).toContain('$0.030000 USD (2/2 calls reported)');
         expect(md).toContain('| Input tokens (cumulative across calls) | 300 (2/2 calls reported) |');
@@ -808,5 +808,83 @@ describe('package-owned Action handoffs', () => {
         expect(retained).toMatchObject({ status: 'delivery_incomplete', inlineStatus: 'unknown' });
         expect(existsSync(join(f.root, 'publication-evidence/fixture/publication-payloads.json'))).toBe(true);
         expect(readFileSync(f.output, 'utf8')).toContain('available=true');
+    });
+});
+
+describe('Action enforcement boundary', () => {
+    it('rejects unknown enforcement before installing a package', () => {
+        const root = mkdtempSync(join(tmpdir(), 'review-action-invalid-policy-'));
+        roots.push(root);
+        const result = spawnSync(
+            process.execPath,
+            [fileURLToPath(new URL('../action/scripts/install.mjs', import.meta.url))],
+            {
+                encoding: 'utf8',
+                env: {
+                    PATH: process.env.PATH,
+                    RUNNER_TEMP: root,
+                    GITHUB_OUTPUT: join(root, 'output'),
+                    PACKAGE_VERSION: '1.0.0',
+                    REVIEWER: reviewer,
+                    MCP_URL: 'https://example.com/mcp',
+                    MCP_ORG_ID: 'fixture',
+                    PROVIDER: 'openrouter',
+                    MODEL: 'fixture',
+                    EFFORT: '',
+                    MAX_TIME_MS: '1000',
+                    FEEDBACK: 'off',
+                    ENFORCEMENT: 'ignore-errors',
+                },
+            },
+        );
+        expect(result.status).toBe(2);
+        const installedRoot = readFileSync(join(root, 'output'), 'utf8').trim().slice('root='.length);
+        expect(JSON.parse(readFileSync(join(installedRoot, 'setup-status.json'), 'utf8')).code).toBe(
+            'invalid_configuration',
+        );
+        expect(existsSync(join(installedRoot, 'tool'))).toBe(false);
+    });
+
+    it.each(['advisory', 'required', 'strict'])('passes %s explicitly and preserves CLI failure', (enforcement) => {
+        const root = mkdtempSync(join(tmpdir(), 'review-action-policy-'));
+        roots.push(root);
+        const cli = join(root, 'tool/node_modules/@contextrail/code-review-agent/dist');
+        mkdirSync(cli, { recursive: true });
+        writeFileSync(
+            join(cli, 'cli.js'),
+            `console.log(JSON.stringify({ args: process.argv.slice(2), ambient: process.env.CONTEXTRAIL_REVIEW_ENFORCEMENT })); process.exitCode = 2;`,
+        );
+        writeFileSync(
+            join(root, 'config.json'),
+            JSON.stringify({
+                enforcement,
+                provider: 'openrouter',
+                model: 'fixture',
+                reviewer,
+                maxTimeMs: '1000',
+                feedback: 'off',
+            }),
+        );
+        writeFileSync(join(root, 'comparison.json'), JSON.stringify({ base, head }));
+        const result = spawnSync(
+            process.execPath,
+            [fileURLToPath(new URL('../action/scripts/review.mjs', import.meta.url))],
+            {
+                encoding: 'utf8',
+                env: {
+                    PATH: process.env.PATH,
+                    REVIEW_ROOT: root,
+                    GITHUB_OUTPUT: join(root, 'output'),
+                    CONTEXTRAIL_MCP_AUTH_TOKEN: 'fixture',
+                    OPENROUTER_API_KEY: 'fixture',
+                    CONTEXTRAIL_REVIEW_ENFORCEMENT: 'strict',
+                },
+            },
+        );
+        expect(result.status).toBe(2);
+        const captured = JSON.parse(readFileSync(join(root, 'cli-stdout.log'), 'utf8'));
+        expect(captured.args[captured.args.indexOf('--enforcement') + 1]).toBe(enforcement);
+        expect(captured.ambient).toBeUndefined();
+        expect(JSON.parse(readFileSync(join(root, 'review-status.json'), 'utf8')).exit).toBe(2);
     });
 });

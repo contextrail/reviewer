@@ -10,7 +10,7 @@ import { loadReviewCheckpoint } from './resume.js';
 import { runReview, DEFAULT_EXECUTION_LIMITS, type ExecutionLimits } from './review.js';
 import { DEFAULT_SOURCE_LIMITS, type SourceLimits } from './source.js';
 import { providerTransportDiagnostics, type ProviderConfiguration } from './providers.js';
-import type { ReviewPolicy } from './results.js';
+import { DEFAULT_POLICY, type ReviewPolicy } from './results.js';
 import { prepareGitHubReview, publishGitHubReview } from './github.js';
 
 // SDK warnings are captured and redacted in the audit; avoid uncontrolled CLI logging.
@@ -50,11 +50,11 @@ Credentials: OPENAI_API_KEY / OPENROUTER_API_KEY. No implicit provider/model fal
 --log-level quiet|info|debug (default info).
 --purpose TEXT supplies caller-stated objective/stage; no inferred objective is treated as approved.
 --pr-context PATH supplies bounded, untrusted PR history/discussion data bound to this comparison; never approval or governing instructions.
---min-adherence 0|1|2 adds a supported adherence gate; omitted means no numerical gate.
---min-confidence 1|2|3 requires model-reported confidence, including nonapplicability; missing/low confidence is incomplete.
---advisory suppresses finding/adherence blockers, never missing scope or execution/report failure.
-Exit 0: bounded completed review accepted by policy; 1: qualifying supported blocker;
-2: incomplete or execution/report error. Underlying review exit is preserved separately.
+--enforcement advisory|required|strict (default advisory).
+Advisory reports judgments without blocking; required blocks supported violations/defects;
+strict also blocks unresolved evidence. No mode changes the recorded judgments.
+Exit 0: allowed by enforcement policy (not proof of compliance); 1: policy blocks;
+2: review unavailable or execution/report error. Review exit is recorded separately.
 
 Execution settings: --max-turns N, --max-output-tokens N, --max-total-tokens N, --max-time-ms N.
 Default: unset (no package ceiling; provider output/context constraints still apply).
@@ -65,7 +65,7 @@ ${Object.entries(sourceFlags)
     .map(([flag, key]) => `--${flag} N (default ${DEFAULT_SOURCE_LIMITS[key]})`)
     .join('\n')}
 Every review option has CONTEXTRAIL_REVIEW_<UPPERCASE_FLAG_WITH_UNDERSCORES> equivalent.
-Set advisory environment to true or false. Limits are operational settings, not scope requirements.
+Limits are operational settings, not scope requirements.
 --feedback send|off (default send) submits minimal metadata after finalization.
 --repository-attribution explicitly includes repository identity in reports and preparation environment.
 Feedback off suppresses metadata submission; local reports are still written.
@@ -117,9 +117,7 @@ function readArguments() {
             'dry-run': { type: 'boolean' },
             purpose: { type: 'string' },
             'pr-context': { type: 'string' },
-            'min-adherence': { type: 'string' },
-            'min-confidence': { type: 'string' },
-            advisory: { type: 'boolean' },
+            enforcement: { type: 'string' },
             feedback: { type: 'string' },
             'repository-attribution': { type: 'boolean' },
             ...Object.fromEntries(
@@ -235,27 +233,17 @@ function readLimits(setting: Setting) {
         throw new CliInputError('source-read-bytes must be >=4.');
     return { limits, sourceLimits };
 }
-function readPolicy(values: CliValues, setting: Setting): ReviewPolicy {
-    const policy: ReviewPolicy = {
-        minAdherence: null,
-        minConfidence: null,
-        advisory: (values.advisory as boolean | undefined) ?? process.env.CONTEXTRAIL_REVIEW_ADVISORY === 'true',
-    };
-    const adherence = setting('min-adherence'),
-        confidence = setting('min-confidence');
-    if (adherence !== undefined && !['0', '1', '2'].includes(adherence))
-        throw new CliInputError('min-adherence must be 0, 1 or 2.');
-    if (confidence !== undefined && !['1', '2', '3'].includes(confidence))
-        throw new CliInputError('min-confidence must be 1, 2 or 3.');
-    if (adherence !== undefined) policy.minAdherence = Number(adherence) as ReviewPolicy['minAdherence'];
-    if (confidence !== undefined) policy.minConfidence = Number(confidence) as ReviewPolicy['minConfidence'];
-    if (
-        process.env.CONTEXTRAIL_REVIEW_ADVISORY !== undefined &&
-        !['true', 'false'].includes(process.env.CONTEXTRAIL_REVIEW_ADVISORY)
-    )
-        throw new CliInputError('CONTEXTRAIL_REVIEW_ADVISORY must be true or false.');
-    return policy;
+function readPolicy(setting: Setting): ReviewPolicy {
+    for (const name of ['ADVISORY', 'MIN_ADHERENCE', 'MIN_CONFIDENCE']) {
+        if (process.env[`CONTEXTRAIL_REVIEW_${name}`] !== undefined)
+            throw new CliInputError(`CONTEXTRAIL_REVIEW_${name} was replaced by CONTEXTRAIL_REVIEW_ENFORCEMENT.`);
+    }
+    const enforcement = setting('enforcement') ?? DEFAULT_POLICY.enforcement;
+    if (!['advisory', 'required', 'strict'].includes(enforcement))
+        throw new CliInputError('enforcement must be advisory, required or strict.');
+    return { enforcement: enforcement as ReviewPolicy['enforcement'] };
 }
+
 function commandSettings(values: CliValues, isReview: boolean) {
     const setting = (flag: string) =>
         ((values as Record<string, string | boolean | undefined>)[flag] as string | undefined) ??
@@ -275,11 +263,7 @@ function commandSettings(values: CliValues, isReview: boolean) {
         logLevel: 'info' as 'quiet' | 'info' | 'debug',
         limits: { ...DEFAULT_EXECUTION_LIMITS },
         sourceLimits: {} as Partial<SourceLimits>,
-        policy: {
-            minAdherence: null,
-            minConfidence: null,
-            advisory: (values.advisory as boolean | undefined) ?? process.env.CONTEXTRAIL_REVIEW_ADVISORY === 'true',
-        } as ReviewPolicy,
+        policy: { ...DEFAULT_POLICY },
     };
     if (!isReview) return { setting, resumePath, feedback, repositoryAttribution, ...defaults };
     const provider = readProvider(setting);
@@ -288,7 +272,7 @@ function commandSettings(values: CliValues, isReview: boolean) {
     if (!['quiet', 'info', 'debug'].includes(level)) throw new CliInputError('Invalid log-level.');
     const logLevel = level as typeof defaults.logLevel;
     const limits = readLimits(setting);
-    const policy = readPolicy(values, setting);
+    const policy = readPolicy(setting);
     return {
         setting,
         resumePath,

@@ -16,7 +16,14 @@ import {
     modelEvidence,
     resolveCitationSelections,
 } from './evidence.js';
-import { DEFAULT_POLICY, decideExit, type ReviewEntry, type AcceptedResult, type ReviewPolicy } from './results.js';
+import {
+    DEFAULT_POLICY,
+    reviewPolicySchema,
+    decideExit,
+    type ReviewEntry,
+    type AcceptedResult,
+    type ReviewPolicy,
+} from './results.js';
 import {
     reviewModel,
     ProviderAccountingError,
@@ -241,7 +248,7 @@ function initialReviewState(
             phaseModels: models,
             limits,
             sourceLimits: source.limits,
-            policy: { ...DEFAULT_POLICY, ...options.policy },
+            policy: reviewPolicySchema.parse({ ...DEFAULT_POLICY, ...options.policy }),
             rubric: { adherence: 'adherence-v1', confidence: 'model-confidence-v1' },
             purpose: options.purpose ?? null,
             prContext: prContext
@@ -1544,7 +1551,7 @@ async function executeReview(run: ReviewRuntime) {
     const { state, models, options, prepared, preparedManifest, diagnostics } = run;
     if (state.preparationStatus !== 'prepared') {
         state.execution.stopReason = 'preparation_incomplete';
-        return false;
+        return true;
     }
     for (const phase of ['assess', 'verify'] as const) reviewModel(models[phase], options.fetch ?? fetch);
     if (

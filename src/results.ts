@@ -33,8 +33,9 @@ export type AcceptedResult = Omit<z.infer<typeof resultSchema>, 'citations'> & {
 };
 type ResultSlot = PreparedState['entries'][number]['result'] | AcceptedResult;
 export type ReviewEntry = Omit<PreparedState['entries'][number], 'result'> & { result: ResultSlot };
-export type ReviewPolicy = { minAdherence: 0 | 1 | 2 | null; minConfidence: 1 | 2 | 3 | null; advisory: boolean };
-export const DEFAULT_POLICY: ReviewPolicy = { minAdherence: null, minConfidence: null, advisory: false };
+export const reviewPolicySchema = z.strictObject({ enforcement: z.enum(['advisory', 'required', 'strict']) });
+export type ReviewPolicy = z.infer<typeof reviewPolicySchema>;
+export const DEFAULT_POLICY: ReviewPolicy = { enforcement: 'advisory' };
 
 function validateJudgment(value: z.infer<typeof resultSchema>) {
     if (value.disposition === 'evaluated') {
@@ -100,16 +101,14 @@ export function validateResult(
     return { ...value, citations, revision: (currentRevision ?? 0) + 1 };
 }
 
-function resultGate(result: ResultSlot, policy: ReviewPolicy) {
+function resultGate(result: ResultSlot) {
     if (result.disposition === 'not_evaluated' || result.disposition === 'unresolved')
         return { name: result.disposition, incomplete: true };
-    if (policy.minConfidence !== null && (result.confidence === null || result.confidence < policy.minConfidence))
-        return { name: 'insufficient_confidence', incomplete: true };
-    if (result.disposition !== 'evaluated') return null;
-    if (result.finding === 'binding_violation' || result.finding === 'behavioral_defect')
+    if (
+        result.disposition === 'evaluated' &&
+        (result.finding === 'binding_violation' || result.finding === 'behavioral_defect')
+    )
         return { name: result.finding, incomplete: false };
-    if (policy.minAdherence !== null && result.adherence !== null && result.adherence < policy.minAdherence)
-        return { name: 'min_adherence', incomplete: false };
     return null;
 }
 
@@ -130,9 +129,24 @@ function addFindingReasons(
                 reasons.some((reason) => reason.assessmentId === id && reason.gate === finding.classification)
             )
                 continue;
-            reasons.push({ assessmentId: id, gate: finding.classification, blocking: !policy.advisory });
+            reasons.push({
+                assessmentId: id,
+                gate: finding.classification,
+                blocking: policy.enforcement !== 'advisory',
+            });
         }
     }
+}
+
+function entryPolicyReasons(entries: ReviewEntry[], policy: ReviewPolicy): PolicyReason[] {
+    return entries.flatMap((entry) => {
+        const gate = resultGate(entry.result);
+        if (!gate) return [];
+        const blocking =
+            gate.name !== 'not_evaluated' &&
+            (gate.incomplete ? policy.enforcement === 'strict' : policy.enforcement !== 'advisory');
+        return [{ assessmentId: entry.assessmentId, gate: gate.name, blocking }];
+    });
 }
 
 /** Judgment is unchanged; only deterministic automation policy is applied here. */
@@ -143,21 +157,20 @@ export function decideExit(
     executionFailure = false,
     findings: PolicyFinding[] = [],
 ) {
-    const reasons: PolicyReason[] = [];
-    let blocker = false;
-    for (const entry of entries) {
-        const gate = resultGate(entry.result, policy);
-        if (!gate) continue;
-        const blocking = !gate.incomplete && !policy.advisory;
-        incomplete ||= gate.incomplete;
-        blocker ||= blocking;
-        reasons.push({ assessmentId: entry.assessmentId, gate: gate.name, blocking });
-    }
+    const reasons = entryPolicyReasons(entries, policy);
+    incomplete ||= reasons.some((reason) => ['unresolved', 'not_evaluated'].includes(reason.gate));
+    let blocker = reasons.some((reason) => reason.blocking);
     addFindingReasons(entries, findings, policy, reasons);
     blocker ||= reasons.some((reason) => reason.blocking);
-    const reviewExit = blocker ? 1 : incomplete ? 2 : 0;
-    // An execution/report failure is separate from the established review judgment.
-    const exitCode = executionFailure ? 2 : reviewExit;
+    const unavailable =
+        executionFailure || !entries.length || entries.some((entry) => entry.result.disposition === 'not_evaluated');
+    if (incomplete && !unavailable && policy.enforcement === 'strict' && !reasons.some((reason) => reason.blocking)) {
+        reasons.push({ assessmentId: null, gate: 'incomplete_assessment', blocking: true });
+        blocker = true;
+    }
+    const reviewExit = blocker ? 1 : 0;
+    // An unavailable review remains an error even when judgments are advisory.
+    const exitCode = unavailable ? 2 : reviewExit;
     const counts = {
         recorded: entries.length,
         evaluated: entries.filter((e) => e.result.disposition === 'evaluated').length,
@@ -165,5 +178,5 @@ export function decideExit(
         notApplicable: entries.filter((e) => e.result.disposition === 'not_applicable').length,
         notEvaluated: entries.filter((e) => e.result.disposition === 'not_evaluated').length,
     };
-    return { exitCode, reviewExit, complete: !incomplete, counts, reasons };
+    return { exitCode, reviewExit, complete: !incomplete && !unavailable, counts, reasons };
 }

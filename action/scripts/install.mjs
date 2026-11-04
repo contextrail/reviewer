@@ -43,7 +43,8 @@ function validateModelConfiguration() {
         !bounded(e.MODEL, /^[A-Za-z0-9._:/-]+$/, 200) ||
         !['', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh'].includes(e.EFFORT) ||
         !positive(e.MAX_TIME_MS, 2147483647) ||
-        !['send', 'off'].includes(e.FEEDBACK)
+        !['send', 'off'].includes(e.FEEDBACK) ||
+        !['advisory', 'required', 'strict'].includes(e.ENFORCEMENT || 'advisory')
     )
         fail('invalid_configuration');
 }
@@ -116,6 +117,7 @@ function configuration(startedAt) {
         inlineComments: e.INLINE_COMMENTS === 'true',
         maxTimeMs: e.MAX_TIME_MS,
         feedback: e.FEEDBACK,
+        enforcement: e.ENFORCEMENT || 'advisory',
         repositoryAttribution: e.REPOSITORY_ATTRIBUTION === 'true',
         repository: e.GITHUB_REPOSITORY,
         pr: Number(e.PR_NUMBER),

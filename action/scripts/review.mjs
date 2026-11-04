@@ -22,6 +22,8 @@ function reviewArguments(c, fixed) {
         c.model,
         '--max-time-ms',
         c.maxTimeMs,
+        '--enforcement',
+        c.enforcement || 'advisory',
         '--feedback',
         c.feedback,
     ];

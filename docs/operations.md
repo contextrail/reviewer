@@ -164,7 +164,7 @@ separate caller-controlled destination when you use the template.
   and effort compatibility. Correct configuration before another paid attempt;
   the CLI does not choose a replacement provider or model.
 - **Incomplete review:** inspect unresolved/not-evaluated entries, preparation gaps,
-  confidence gates, operation limits and available source. Fetch missing Git objects
+  operation limits and available source. Fetch missing Git objects
   or supply a better bounded comparison, then run again. Advisory mode does not
   resolve missing evidence. An exit-1 run can still be incomplete.
 - **Feedback failed:** inspect `execution.reporting` or `reporting-status.json` when

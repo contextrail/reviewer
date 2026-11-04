@@ -26,6 +26,10 @@ inputs:
   model:
     description: 'Provider-native model ID.'
     required: true
+  enforcement:
+    description: 'advisory reports only; required blocks violations; strict also blocks evidence gaps. Execution failures always fail.'
+    required: false
+    default: advisory
   effort:
     description: 'CLI effort; empty uses provider default.'
     required: false
@@ -124,6 +128,7 @@ runs:
         PROVIDER: ${{ inputs.provider }}
         MODEL: ${{ inputs.model }}
         EFFORT: ${{ inputs.effort }}
+        ENFORCEMENT: ${{ inputs.enforcement }}
         PHASE_MODELS: ${{ inputs.phase-models }}
         LOG_LEVEL: ${{ inputs.log-level }}
         INLINE_COMMENTS: ${{ inputs.inline-comments }}

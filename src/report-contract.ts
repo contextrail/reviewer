@@ -90,11 +90,15 @@ export const reviewReportInputSchema = z
             .max(5000),
         runner: z
             .strictObject({
-                policy: z.strictObject({
-                    minAdherence: z.union([z.literal(0), z.literal(1), z.literal(2), z.null()]),
-                    minConfidence: z.union([z.literal(1), z.literal(2), z.literal(3), z.null()]),
-                    advisory: z.boolean(),
-                }),
+                policy: z.union([
+                    z.strictObject({ enforcement: z.enum(['advisory', 'required', 'strict']) }),
+                    // Historical reports retain the policy and decision semantics used at the time.
+                    z.strictObject({
+                        minAdherence: z.union([z.literal(0), z.literal(1), z.literal(2), z.null()]),
+                        minConfidence: z.union([z.literal(1), z.literal(2), z.literal(3), z.null()]),
+                        advisory: z.boolean(),
+                    }),
+                ]),
                 reviewExit: z.union([z.literal(0), z.literal(1), z.literal(2)]),
                 exitCode: z.union([z.literal(0), z.literal(1), z.literal(2)]),
             })
@@ -161,31 +165,20 @@ export const reviewReportInputSchema = z
             )
                 issue();
             if (v.origin === 'agent_skill' ? o.blocking !== null : typeof o.blocking !== 'boolean') issue();
-            if (v.runner) {
-                const p = v.runner.policy;
-                const assured = p.minConfidence === null || (o.confidence !== null && o.confidence >= p.minConfidence);
-                const blocking =
-                    !p.advisory &&
-                    ((o.disposition === 'unresolved' &&
-                        ['binding_violation', 'behavioral_defect'].includes(o.finding)) ||
-                        (assured &&
-                            o.disposition === 'evaluated' &&
-                            (['binding_violation', 'behavioral_defect'].includes(o.finding) ||
-                                (p.minAdherence !== null && o.adherence !== null && o.adherence < p.minAdherence))));
-                if (o.blocking !== blocking) issue();
-            }
+            if (v.runner && o.blocking !== policyBlocksOutcome(v.runner.policy, o)) issue();
         }
         if (
             v.origin === 'npm' ? !v.runner || v.packageVersion === null : v.runner !== null || v.packageVersion !== null
         )
             issue();
         if (v.completion === 'complete' && (!isCompleteReviewCoverage(v) || v.stopReason !== 'finished')) issue();
-        if (v.runner) {
+        if (v.runner && 'enforcement' in v.runner.policy) {
+            if (!validEnforcementDecision(v)) issue();
+        } else if (v.runner && 'advisory' in v.runner.policy) {
+            const policy = v.runner.policy;
             const blocking = v.outcomes.some((o) => o.blocking);
             const insufficient = v.outcomes.some(
-                (o) =>
-                    v.runner!.policy.minConfidence !== null &&
-                    (o.confidence === null || o.confidence < v.runner!.policy.minConfidence),
+                (o) => policy.minConfidence !== null && (o.confidence === null || o.confidence < policy.minConfidence),
             );
             const reviewExit = blocking ? 1 : v.completion === 'incomplete' || insufficient ? 2 : 0;
             if (v.completion === 'complete' && insufficient) issue();
@@ -222,3 +215,44 @@ export function isCompleteReviewCoverage(report: Pick<ReviewReportInput, 'scope'
     );
 }
 export type ReviewReportReceipt = { runId: string; eventId: string; receivedAt: string; duplicate: boolean };
+
+type ReportPolicy = NonNullable<ReviewReportInput['runner']>['policy'];
+type ReportOutcome = ReviewReportInput['outcomes'][number];
+function policyBlocksOutcome(policy: ReportPolicy, outcome: ReportOutcome): boolean {
+    const supportedFinding =
+        ['evaluated', 'unresolved'].includes(outcome.disposition) &&
+        ['binding_violation', 'behavioral_defect'].includes(outcome.finding);
+    if ('enforcement' in policy) {
+        return (
+            policy.enforcement !== 'advisory' &&
+            (supportedFinding || (policy.enforcement === 'strict' && outcome.disposition === 'unresolved'))
+        );
+    }
+    if (policy.advisory) return false;
+    if (outcome.disposition === 'unresolved') return supportedFinding;
+    const assured =
+        policy.minConfidence === null || (outcome.confidence !== null && outcome.confidence >= policy.minConfidence);
+    return (
+        assured &&
+        outcome.disposition === 'evaluated' &&
+        (supportedFinding ||
+            (policy.minAdherence !== null && outcome.adherence !== null && outcome.adherence < policy.minAdherence))
+    );
+}
+
+function validEnforcementDecision(report: ReviewReportInput): boolean {
+    const runner = report.runner;
+    if (!runner || !('enforcement' in runner.policy)) return false;
+    const blocking = report.outcomes.some((o) => o.blocking);
+    const strictGap = runner.policy.enforcement === 'strict' && report.completion === 'incomplete';
+    const executionFailed =
+        report.stopReason !== 'finished' ||
+        report.scope.enumeration !== 'complete' ||
+        report.scope.expected.some(
+            (e) =>
+                e.context.version === null ||
+                !report.outcomes.some((o) => o.entryId === e.entryId && o.disposition !== 'not_evaluated'),
+        );
+    const reviewExit = blocking || (strictGap && !executionFailed) ? 1 : 0;
+    return runner.reviewExit === reviewExit && runner.exitCode === (executionFailed ? 2 : reviewExit);
+}
